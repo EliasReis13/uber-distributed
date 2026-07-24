@@ -7,6 +7,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <style>
     :root {
       --ink: #12141a;
@@ -290,6 +292,27 @@
     .results { display: none; }
     .results.show { display: block; animation: rise 0.45s ease both; }
 
+    .insights { display: none; }
+    .insights.show { display: block; animation: rise 0.45s ease both; }
+
+    #zoneMap {
+      height: 340px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      margin-top: 0.85rem;
+      z-index: 0;
+    }
+
+    .bar-row.hour {
+      grid-template-columns: 44px 1fr 70px;
+    }
+
+    .insight-note {
+      margin: 0.35rem 0 0;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
     .metrics {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -547,8 +570,31 @@
       <div class="meta-line" id="metaLine"></div>
     </section>
 
+    <section class="panel insights" id="insightsPanel" style="margin-top:1rem" aria-live="polite">
+      <h2 style="margin:0 0 0.35rem">Insights de demanda</h2>
+      <p class="insight-note">
+        Cruzamentos de hora do dia, dia da semana e zona geográfica (Lat/Lon)
+        para apoiar alocação de motoristas, precificação e posicionamento de frota.
+      </p>
+
+      <div class="two-col" style="margin-top:1rem">
+        <div>
+          <h2>Demanda por hora do dia</h2>
+          <div class="bars" id="hourBars"></div>
+        </div>
+        <div>
+          <h2>Demanda por dia da semana</h2>
+          <div class="bars" id="weekdayBars"></div>
+        </div>
+      </div>
+
+      <h2 style="margin-top:1.25rem">Zonas de maior concentração</h2>
+      <p class="insight-note">Grade ~1,1 km · top zonas no intervalo consultado</p>
+      <div id="zoneMap"></div>
+    </section>
+
     <footer>
-      UNEB · LPIII ·
+      Elias Reis da Silva · Kaique Willian Santos da Silva · UNEB · LPIII · 2026 ·
       <a href="/docs" target="_blank" rel="noopener">Swagger /docs</a>
     </footer>
   </div>
@@ -560,6 +606,100 @@
      *  `loadLocal()` a partir de `/metadata`. Usada pelo preset "Só <mês>"
      *  para refletir o mês real deste servidor, em vez de um valor fixo. */
     let currentOwns = null;
+
+    /** Instância Leaflet do mapa de zonas; criada uma vez na carga da página. */
+    let zoneMap = null;
+    /** Camada de marcadores atuais (para limpar entre consultas). */
+    let zoneLayer = null;
+
+    const WEEKDAY_LABELS = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+
+    /** Inicializa o mapa Leaflet centrado em NYC (chamado uma vez). */
+    function initZoneMap() {
+      if (zoneMap || typeof L === "undefined") return;
+      zoneMap = L.map("zoneMap", { scrollWheelZoom: false }).setView([40.7128, -74.006], 11);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 18,
+        attribution: "&copy; OpenStreetMap",
+      }).addTo(zoneMap);
+      zoneLayer = L.layerGroup().addTo(zoneMap);
+    }
+
+    /** Preenche um container `.bars` a partir de entradas [rótulo, contagem]. */
+    function fillBars(container, entries, { labelClass = "code" } = {}) {
+      container.innerHTML = "";
+      if (!entries.length) {
+        container.innerHTML = `<div class="hint">Sem dados neste intervalo.</div>`;
+        return;
+      }
+      const max = entries[0][1];
+      for (const [label, count] of entries) {
+        const row = document.createElement("div");
+        row.className = labelClass === "hour" ? "bar-row hour" : "bar-row";
+        const pct = max ? Math.round((count / max) * 100) : 0;
+        row.innerHTML = `
+          <div class="code">${label}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:0%"></div></div>
+          <div class="n">${fmt(count)}</div>
+        `;
+        container.appendChild(row);
+        requestAnimationFrame(() => {
+          row.querySelector(".bar-fill").style.width = `${pct}%`;
+        });
+      }
+    }
+
+    /** Renderiza insights (hora, dia da semana e mapa de zonas). */
+    function renderInsights(data) {
+      const result = data?.result || {};
+      const panel = $("#insightsPanel");
+      panel.classList.add("show");
+
+      const byHour = result.by_hour || {};
+      const hourEntries = [];
+      for (let h = 0; h < 24; h++) {
+        const key = String(h).padStart(2, "0");
+        const n = Number(byHour[key] || 0);
+        if (n > 0) hourEntries.push([`${key}h`, n]);
+      }
+      hourEntries.sort((a, b) => b[1] - a[1]);
+      fillBars($("#hourBars"), hourEntries, { labelClass: "hour" });
+
+      const byWeekday = result.by_weekday || {};
+      const weekdayEntries = WEEKDAY_LABELS.map((label, i) => [
+        label,
+        Number(byWeekday[String(i)] || 0),
+      ]).sort((a, b) => b[1] - a[1]);
+      fillBars($("#weekdayBars"), weekdayEntries);
+
+      initZoneMap();
+      if (!zoneMap || !zoneLayer) return;
+      zoneLayer.clearLayers();
+      const zones = result.top_zones || [];
+      if (!zones.length) {
+        zoneMap.setView([40.7128, -74.006], 11);
+        return;
+      }
+      const maxCount = Math.max(...zones.map((z) => z.count));
+      const bounds = [];
+      for (const z of zones) {
+        const radius = 6 + Math.round((z.count / maxCount) * 18);
+        const opacity = 0.35 + (z.count / maxCount) * 0.5;
+        const marker = L.circleMarker([z.lat, z.lon], {
+          radius,
+          color: "#0f766e",
+          weight: 1,
+          fillColor: "#0ea5e9",
+          fillOpacity: opacity,
+        }).bindPopup(
+          `<strong>${fmt(z.count)}</strong> pickups<br>${z.lat.toFixed(2)}, ${z.lon.toFixed(2)}`
+        );
+        zoneLayer.addLayer(marker);
+        bounds.push([z.lat, z.lon]);
+      }
+      zoneMap.fitBounds(bounds, { padding: [28, 28], maxZoom: 13 });
+      requestAnimationFrame(() => zoneMap.invalidateSize());
+    }
 
     /** Formata um número com separadores de milhar em pt-BR. */
     function fmt(n) {
@@ -755,8 +895,8 @@
     }
 
     /** Handler de submit do formulário de consulta: monta os query params,
-     *  chama `/summary` ou `/local/summary` conforme o escopo escolhido e
-     *  renderiza o resultado (ou uma mensagem de erro legível). */
+     *  chama summary + insights em paralelo conforme o escopo e renderiza
+     *  o resultado (ou uma mensagem de erro legível). */
     async function runQuery(ev) {
       ev?.preventDefault();
       const form = $("#queryForm");
@@ -769,7 +909,8 @@
       const params = new URLSearchParams({ start_date: start, end_date: end });
       if (base) params.set("base", base);
 
-      const path = scope === "local" ? "/local/summary" : "/summary";
+      const summaryPath = scope === "local" ? "/local/summary" : "/summary";
+      const insightsPath = scope === "local" ? "/local/insights" : "/insights";
       const btn = $("#runBtn");
       const err = $("#errorBox");
       err.classList.remove("show");
@@ -777,12 +918,22 @@
       btn.textContent = "Consultando…";
 
       try {
-        const res = await fetch(`${path}?${params}`);
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(errorMessage(data));
+        const [summaryRes, insightsRes] = await Promise.all([
+          fetch(`${summaryPath}?${params}`),
+          fetch(`${insightsPath}?${params}`),
+        ]);
+        const summaryData = await summaryRes.json();
+        if (!summaryRes.ok) {
+          throw new Error(errorMessage(summaryData));
         }
-        renderResult(data);
+        renderResult(summaryData);
+
+        if (insightsRes.ok) {
+          const insightsData = await insightsRes.json();
+          renderInsights(insightsData);
+        } else {
+          $("#insightsPanel").classList.remove("show");
+        }
       } catch (e) {
         err.textContent = String(e.message || e);
         err.classList.add("show");
@@ -810,6 +961,7 @@
 
     (async () => {
       try {
+        initZoneMap();
         await loadLocal();
         await loadCluster();
       } catch (_) {
