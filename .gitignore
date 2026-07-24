@@ -45,4 +45,5 @@ Desktop.ini
 # Logs and local data dumps
 *.log
 data/*.csv
+data/*.db
 !data/.gitkeep
