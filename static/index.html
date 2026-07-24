@@ -496,7 +496,7 @@
         <div class="actions">
           <button type="submit" class="btn-primary" id="runBtn">Executar consulta</button>
           <button type="button" class="btn-secondary" id="presetAprJun">Abr–Set (6 meses)</button>
-          <button type="button" class="btn-ghost" id="presetApr">Só abril</button>
+          <button type="button" class="btn-ghost" id="presetApr" disabled>Só este nó</button>
           <span class="hint">O coordenador chama <code>/local/summary</code> nos demais nós.</span>
         </div>
       </form>
@@ -556,6 +556,11 @@
   <script>
     const $ = (sel) => document.querySelector(sel);
 
+    /** Partição (`owns`) do nó que está servindo esta página, resolvida por
+     *  `loadLocal()` a partir de `/metadata`. Usada pelo preset "Só <mês>"
+     *  para refletir o mês real deste servidor, em vez de um valor fixo. */
+    let currentOwns = null;
+
     /** Formata um número com separadores de milhar em pt-BR. */
     function fmt(n) {
       return Number(n || 0).toLocaleString("pt-BR");
@@ -606,7 +611,8 @@
     }
 
     /** Carrega `/health` e `/metadata` deste nó e atualiza o cabeçalho
-     *  (pill de status + dica de partição). Lança se o nó estiver offline. */
+     *  (pill de status + dica de partição) e o preset "Só <mês>" com a
+     *  partição real deste servidor. Lança se o nó estiver offline. */
     async function loadLocal() {
       try {
         const [health, meta] = await Promise.all([
@@ -619,10 +625,26 @@
         $("#partitionHint").textContent = owns.date_start
           ? `Este nó guarda ${fmtDate(owns.date_start)} → ${fmtDate(owns.date_end)} (${owns.partition_description || ""})`
           : "";
+
+        const presetBtn = $("#presetApr");
+        if (owns.date_start && owns.date_end) {
+          currentOwns = owns;
+          presetBtn.disabled = false;
+          presetBtn.textContent = `Só ${owns.partition_description || fmtDate(owns.date_start)}`;
+        } else {
+          currentOwns = null;
+          presetBtn.disabled = true;
+          presetBtn.textContent = "Só este nó";
+        }
+
         return { health, meta };
       } catch (err) {
+        currentOwns = null;
         $("#localDot").classList.add("off");
         $("#localLabel").textContent = "servidor offline";
+        const presetBtn = $("#presetApr");
+        presetBtn.disabled = true;
+        presetBtn.textContent = "Só este nó";
         throw err;
       }
     }
@@ -779,9 +801,10 @@
       f.scope.value = "distributed";
     });
     $("#presetApr").addEventListener("click", () => {
+      if (!currentOwns) return;
       const f = $("#queryForm");
-      f.start_date.value = "2014-04-01";
-      f.end_date.value = "2014-04-30";
+      f.start_date.value = currentOwns.date_start;
+      f.end_date.value = currentOwns.date_end;
       f.scope.value = "local";
     });
 
