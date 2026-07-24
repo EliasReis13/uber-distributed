@@ -239,6 +239,19 @@ if SERVER_PORT not in NODES:
 NODE: NodeConfig = NODES[SERVER_PORT]
 SERVER_ID: str = NODE["server_id"]
 
+# Nomes das bases TLC presentes nos CSVs abr–set/2014 (FiveThirtyEight).
+# B02765/B02835/B02836 existem no README do FOIL, mas só nos dados de 2015.
+BASE_NAMES: dict[str, str] = {
+    "B02512": "Unter",
+    "B02598": "Hinter",
+    "B02617": "Weiter",
+    "B02682": "Schmecken",
+    "B02764": "Danach-NY",
+}
+_BASE_BY_NAME: dict[str, str] = {
+    name.casefold(): code for code, name in BASE_NAMES.items()
+}
+
 # KNOWN_SERVERS pode ser configurado via variável de ambiente para apontar
 # para máquinas reais na rede, ex.:
 #   KNOWN_SERVERS=http://192.168.1.12:8002,http://192.168.1.13:8003
@@ -403,13 +416,38 @@ def parse_date(value: str, name: str) -> date:
         raise HTTPException(400, f"Formato inválido para '{name}'. Use YYYY-MM-DD.")
 
 
+def resolve_base_filter(base: Optional[str]) -> Optional[str]:
+    """Normaliza o filtro ``base`` para o código TLC canônico.
+
+    Aceita código (``B02682``), nome (``Schmecken``) ou ``Nome (código)``.
+    Comparação de nome é case-insensitive. Valores desconhecidos são
+    devolvidos como vieram (a consulta tende a retornar zero).
+    """
+    if not base:
+        return None
+    raw = base.strip()
+    if not raw:
+        return None
+    if raw.endswith(")") and "(" in raw:
+        maybe_code = raw[raw.rfind("(") + 1 : -1].strip().upper()
+        if maybe_code in BASE_NAMES:
+            return maybe_code
+    upper = raw.upper()
+    if upper in BASE_NAMES:
+        return upper
+    by_name = _BASE_BY_NAME.get(raw.casefold())
+    if by_name:
+        return by_name
+    return raw
+
+
 def summarize(start: date, end: date, base: Optional[str] = None) -> SummaryResult:
     """Conta embarques locais no intervalo ``[start, end]`` via SQL indexado.
 
     Args:
         start: Data inicial (inclusiva).
         end: Data final (inclusiva).
-        base: Se informado, filtra pela coluna Base do CSV.
+        base: Se informado, filtra pela coluna Base do CSV (código TLC).
 
     Returns:
         Contagem total, contagens por base e timestamps do primeiro/último
@@ -739,7 +777,7 @@ def local_summary(
     Args:
         start_date: Data inicial no formato ``YYYY-MM-DD``.
         end_date: Data final no formato ``YYYY-MM-DD``.
-        base: Filtro opcional pela base TLC.
+        base: Filtro opcional por código TLC ou nome da base.
 
     Raises:
         HTTPException: Datas inválidas ou ``start_date`` > ``end_date``.
@@ -748,7 +786,7 @@ def local_summary(
     if start > end:
         raise HTTPException(400, "start_date não pode ser maior que end_date.")
 
-    base_clean = base.strip() if base else None
+    base_clean = resolve_base_filter(base)
     return {
         "server_id": SERVER_ID,
         "scope": "local",
@@ -775,7 +813,7 @@ async def distributed_summary(
     Args:
         start_date: Data inicial no formato ``YYYY-MM-DD``.
         end_date: Data final no formato ``YYYY-MM-DD``.
-        base: Filtro opcional pela base TLC.
+        base: Filtro opcional por código TLC ou nome da base.
 
     Raises:
         HTTPException: Datas inválidas ou ``start_date`` > ``end_date``.
@@ -784,7 +822,7 @@ async def distributed_summary(
     if start > end:
         raise HTTPException(400, "start_date não pode ser maior que end_date.")
 
-    base_clean = base.strip() if base else None
+    base_clean = resolve_base_filter(base)
     params: dict[str, Any] = {"start_date": start_date, "end_date": end_date}
     if base_clean:
         params["base"] = base_clean
@@ -847,7 +885,7 @@ def local_insights(
     Args:
         start_date: Data inicial no formato ``YYYY-MM-DD``.
         end_date: Data final no formato ``YYYY-MM-DD``.
-        base: Filtro opcional pela base TLC.
+        base: Filtro opcional por código TLC ou nome da base.
 
     Raises:
         HTTPException: Datas inválidas ou ``start_date`` > ``end_date``.
@@ -856,7 +894,7 @@ def local_insights(
     if start > end:
         raise HTTPException(400, "start_date não pode ser maior que end_date.")
 
-    base_clean = base.strip() if base else None
+    base_clean = resolve_base_filter(base)
     return {
         "server_id": SERVER_ID,
         "scope": "local",
@@ -879,7 +917,7 @@ async def distributed_insights(
     Args:
         start_date: Data inicial no formato ``YYYY-MM-DD``.
         end_date: Data final no formato ``YYYY-MM-DD``.
-        base: Filtro opcional pela base TLC.
+        base: Filtro opcional por código TLC ou nome da base.
 
     Raises:
         HTTPException: Datas inválidas ou ``start_date`` > ``end_date``.
@@ -888,7 +926,7 @@ async def distributed_insights(
     if start > end:
         raise HTTPException(400, "start_date não pode ser maior que end_date.")
 
-    base_clean = base.strip() if base else None
+    base_clean = resolve_base_filter(base)
     params: dict[str, Any] = {"start_date": start_date, "end_date": end_date}
     if base_clean:
         params["base"] = base_clean
