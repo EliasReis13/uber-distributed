@@ -89,6 +89,15 @@ def test_distributed_summary() -> None:
     assert data["coordinator"] in data["servers_contacted"]
 
 
+def test_distributed_summary_skips_irrelevant_servers() -> None:
+    """Consulta restrita ao mês do coordenador não contata vizinhos de outros meses."""
+    r = get("/summary", start_date="2014-04-01", end_date="2014-04-30")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["servers_contacted"] == [data["coordinator"]]
+    assert data["failed_servers"] == []
+
+
 def test_distributed_gte_local() -> None:
     """Contagem distribuída é maior ou igual à contagem só local."""
     local = get("/local/summary", start_date="2014-04-01", end_date="2014-04-30").json()
