@@ -1,4 +1,4 @@
-"""Testes de integração do cluster Uber (requer servidores em 8001–8003).
+"""Testes de integração do cluster Uber (requer servidores em 8001–8006).
 
 Pré-requisito
 -------------
@@ -42,6 +42,19 @@ def test_health() -> None:
     assert "server_id" in data
 
 
+def test_metadata_structure() -> None:
+    """``GET /metadata`` retorna ``owns.date_start/date_end`` e vizinhos conhecidos."""
+    r = get("/metadata")
+    assert r.status_code == 200
+    data = r.json()
+    assert "server_id" in data
+    owns = data["owns"]
+    assert "date_start" in owns
+    assert "date_end" in owns
+    assert "partition_description" in owns
+    assert isinstance(data["known_servers"], list)
+
+
 def test_local_summary() -> None:
     """``GET /local/summary`` retorna escopo local e contagem inteira."""
     r = get("/local/summary", start_date="2014-04-01", end_date="2014-04-30")
@@ -81,3 +94,13 @@ def test_distributed_gte_local() -> None:
     local = get("/local/summary", start_date="2014-04-01", end_date="2014-04-30").json()
     dist = get("/summary", start_date="2014-04-01", end_date="2014-04-30").json()
     assert dist["result"]["pickup_count"] >= local["result"]["pickup_count"]
+
+
+def test_distributed_summary_query_field() -> None:
+    """``GET /summary`` ecoa os parâmetros recebidos em ``query``."""
+    r = get("/summary", start_date="2014-04-01", end_date="2014-04-30", base="B02512")
+    assert r.status_code == 200
+    query = r.json()["query"]
+    assert query["start_date"] == "2014-04-01"
+    assert query["end_date"] == "2014-04-30"
+    assert query["base"] == "B02512"
