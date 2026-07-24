@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Inicia / para os servidores do cluster Uber.
+"""Sobe / para o cluster Uber (3 servidores).
 
-Uso:
-  python start.py          # sobe os 6 servidores
-  python start.py stop     # encerra processos nas portas 8001–8006
-  python start.py 1        # sobe só o servidor 01 (também: 2 … 6)
+  python start.py       # sobe 8001–8003
+  python start.py stop  # encerra
+  python start.py 1     # sobe só o servidor 01
 """
 
 from __future__ import annotations
@@ -17,34 +16,13 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_DIR = ROOT / "config"
-PORTS = list(range(8001, 8007))
-
-
-def load_env(path: Path) -> dict[str, str]:
-    env: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        env[key.strip()] = value.strip()
-    return env
-
-
-def config_files() -> list[Path]:
-    files = sorted(CONFIG_DIR.glob("servidor_*.env"))
-    if not files:
-        sys.exit(f"Nenhum config encontrado em {CONFIG_DIR}")
-    return files
+PORTS = [8001, 8002, 8003]
 
 
 def pid_on_port(port: int) -> int | None:
     if sys.platform == "win32":
         try:
-            out = subprocess.check_output(
-                ["netstat", "-ano"], text=True, errors="ignore"
-            )
+            out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
         except (OSError, subprocess.CalledProcessError):
             return None
         for line in out.splitlines():
@@ -56,9 +34,7 @@ def pid_on_port(port: int) -> int | None:
         return None
 
     try:
-        out = subprocess.check_output(
-            ["lsof", "-ti", f"tcp:{port}"], text=True, errors="ignore"
-        )
+        out = subprocess.check_output(["lsof", "-ti", f"tcp:{port}"], text=True, errors="ignore")
         for token in out.split():
             if token.isdigit():
                 return int(token)
@@ -68,18 +44,14 @@ def pid_on_port(port: int) -> int | None:
 
 
 def stop_all() -> None:
-    killed: list[int] = []
+    killed = []
     for port in PORTS:
         pid = pid_on_port(port)
         if pid is None:
             continue
         try:
             if sys.platform == "win32":
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/F"],
-                    check=False,
-                    capture_output=True,
-                )
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False, capture_output=True)
             else:
                 os.kill(pid, signal.SIGTERM)
             killed.append(pid)
@@ -87,75 +59,51 @@ def stop_all() -> None:
         except OSError as exc:
             print(f"  porta {port}: falha ao encerrar PID {pid}: {exc}")
     if not killed:
-        print("Nenhum servidor ativo nas portas 8001–8006.")
+        print("Nenhum servidor ativo nas portas 8001–8003.")
     else:
         print(f"Encerrados {len(killed)} processo(s).")
 
 
-def start_one(env_path: Path, *, foreground: bool = False) -> subprocess.Popen | None:
-    cfg = load_env(env_path)
-    port = int(cfg.get("SERVER_PORT", "0"))
-    server_id = cfg.get("SERVER_ID", env_path.stem)
-
+def start_one(port: int, *, foreground: bool = False) -> subprocess.Popen | None:
     existing = pid_on_port(port)
     if existing is not None:
-        print(f"  {server_id}: porta {port} já em uso (PID {existing}) — pulando")
+        print(f"  porta {port} já em uso (PID {existing}) — pulando")
         return None
 
-    child_env = os.environ.copy()
-    child_env.update(cfg)
-    child_env.setdefault("PYTHONUNBUFFERED", "1")
+    env = os.environ.copy()
+    env["SERVER_PORT"] = str(port)
+    env.setdefault("PYTHONUNBUFFERED", "1")
 
     cmd = [
-        sys.executable,
-        "-m",
-        "uvicorn",
-        "server.app:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(port),
-        "--log-level",
-        "info",
+        sys.executable, "-m", "uvicorn", "server.app:app",
+        "--host", "0.0.0.0", "--port", str(port), "--log-level", "info",
     ]
-
-    print(f"  ▶ {server_id} → http://localhost:{port}/")
+    print(f"  > servidor_{port - 8000:02d} -> http://localhost:{port}/")
 
     if foreground:
-        subprocess.run(cmd, cwd=ROOT, env=child_env)
+        subprocess.run(cmd, cwd=ROOT, env=env)
         return None
-
-    return subprocess.Popen(cmd, cwd=ROOT, env=child_env)
+    return subprocess.Popen(cmd, cwd=ROOT, env=env)
 
 
 def start_all() -> None:
-    occupied = [p for p in PORTS if pid_on_port(p) is not None]
-    if occupied:
+    if any(pid_on_port(p) for p in PORTS):
         print("Liberando portas ocupadas…")
         stop_all()
         time.sleep(1)
 
-    print("Iniciando cluster Uber (6 servidores)…\n")
-    procs: list[subprocess.Popen] = []
-    for path in config_files():
-        proc = start_one(path)
-        if proc is not None:
-            procs.append(proc)
+    print("Iniciando cluster (3 servidores)…\n")
+    procs = [p for p in (start_one(port) for port in PORTS) if p is not None]
 
-    print(
-        "\nPronto. Interface: http://localhost:8001/\n"
-        "Para encerrar: python start.py stop   (ou Ctrl+C)\n"
-    )
+    print("\nPronto. Interface: http://localhost:8001/")
+    print("Para encerrar: python start.py stop   (ou Ctrl+C)\n")
     if not procs:
         return
 
     try:
-        while True:
-            alive = [p for p in procs if p.poll() is None]
-            if not alive:
-                print("Todos os processos terminaram.")
-                break
+        while any(p.poll() is None for p in procs):
             time.sleep(1)
+        print("Todos os processos terminaram.")
     except KeyboardInterrupt:
         print("\nEncerrando…")
         for p in procs:
@@ -166,17 +114,6 @@ def start_all() -> None:
                 p.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 p.kill()
-
-
-def resolve_single(arg: str) -> Path:
-    if arg.isdigit():
-        path = CONFIG_DIR / f"servidor_{int(arg):02d}.env"
-    else:
-        name = arg if arg.endswith(".env") else f"{arg}.env"
-        path = CONFIG_DIR / name if (CONFIG_DIR / name).exists() else Path(arg)
-    if not path.exists():
-        sys.exit(f"Config não encontrado: {path}")
-    return path
 
 
 def main() -> None:
@@ -194,9 +131,11 @@ def main() -> None:
     if cmd in {"help", "-h", "--help"}:
         print(__doc__)
         return
+    if cmd in {"1", "2", "3"}:
+        start_one(8000 + int(cmd), foreground=True)
+        return
 
-    env_path = resolve_single(args[0])
-    start_one(env_path, foreground=True)
+    sys.exit(f"Uso: python start.py [stop|1|2|3]\n{__doc__}")
 
 
 if __name__ == "__main__":
