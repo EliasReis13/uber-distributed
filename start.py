@@ -12,6 +12,10 @@ Uso
 Para implantação em rede real (uma máquina por servidor), use
 ``python start.py N`` em cada máquina (ver README.md, seção "Rodando em
 máquinas diferentes na mesma rede").
+
+``SERVER_PORT``, ``KNOWN_SERVERS`` e ``HTTP_TIMEOUT`` podem vir de um
+arquivo ``.env`` na raiz do projeto (copie ``.env.example``), em vez de
+exportar variáveis manualmente a cada terminal aberto.
 """
 
 from __future__ import annotations
@@ -24,8 +28,17 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 ROOT: Path = Path(__file__).resolve().parent
 PORTS: list[int] = [8001, 8002, 8003, 8004, 8005, 8006]
+
+# Carrega o ``.env`` da raiz (se existir) para dentro de ``os.environ`` deste
+# processo, ANTES de qualquer subprocesso ser criado — assim ``start_one()``
+# e ``open_terminal_for()``, que copiam ``os.environ``, repassam KNOWN_SERVERS
+# / HTTP_TIMEOUT do ``.env`` para o uvicorn. Não sobrescreve variáveis já
+# exportadas manualmente no shell (override=False por padrão).
+load_dotenv(ROOT / ".env")
 
 
 def _uvicorn_command(port: int) -> str:
