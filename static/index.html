@@ -381,7 +381,7 @@
 
     .bar-row {
       display: grid;
-      grid-template-columns: 70px 1fr 70px;
+      grid-template-columns: 110px 1fr 70px;
       gap: 0.65rem;
       align-items: center;
       font-size: 0.82rem;
@@ -402,7 +402,9 @@
       transition: width 0.7s cubic-bezier(0.22, 1, 0.36, 1);
     }
 
-    .bar-row .code { font-weight: 700; }
+    .bar-row .base-label { line-height: 1.25; min-width: 0; }
+    .bar-row .base-label .name { font-weight: 700; }
+    .bar-row .base-label .code { color: var(--muted); font-size: 0.72rem; font-variant-numeric: tabular-nums; }
     .bar-row .n { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
 
     .chips {
@@ -506,7 +508,7 @@
           </label>
           <label>
             Base (opcional)
-            <input type="text" name="base" placeholder="ex: B02512" />
+            <input type="text" name="base" placeholder="ex: B02512 (Unter)" />
           </label>
           <label>
             Escopo
@@ -613,6 +615,24 @@
     let zoneLayer = null;
 
     const WEEKDAY_LABELS = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+
+    /** Nomes das bases TLC Uber (FiveThirtyEight / FOIL response). */
+    const BASE_NAMES = {
+      B02512: "Unter",
+      B02598: "Hinter",
+      B02617: "Weiter",
+      B02682: "Schmecken",
+      B02764: "Danach-NY",
+      B02765: "Grun",
+      B02835: "Dreist",
+      B02836: "Drinnen",
+    };
+
+    /** Código TLC → rótulo "Nome (código)", ou só o código se desconhecido. */
+    function baseLabel(code) {
+      const name = BASE_NAMES[code];
+      return name ? `${name} (${code})` : code;
+    }
 
     /** Inicializa o mapa Leaflet centrado em NYC (chamado uma vez). */
     function initZoneMap() {
@@ -863,8 +883,12 @@
           const row = document.createElement("div");
           row.className = "bar-row";
           const pct = max ? Math.round((count / max) * 100) : 0;
+          const name = BASE_NAMES[code];
           row.innerHTML = `
-            <div class="code">${code}</div>
+            <div class="base-label" title="${baseLabel(code)}">
+              <div class="name">${name || code}</div>
+              ${name ? `<div class="code">${code}</div>` : ""}
+            </div>
             <div class="bar-track"><div class="bar-fill" style="width:0%"></div></div>
             <div class="n">${fmt(count)}</div>
           `;
@@ -889,7 +913,7 @@
         bits.push(
           `<span>período <strong>${fmtDate(data.query.start_date)} → ${fmtDate(data.query.end_date)}</strong></span>`
         );
-        if (data.query.base) bits.push(`<span>base <strong>${data.query.base}</strong></span>`);
+        if (data.query.base) bits.push(`<span>base <strong>${baseLabel(data.query.base)}</strong></span>`);
       }
       $("#metaLine").innerHTML = bits.join("");
     }
