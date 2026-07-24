@@ -1,4 +1,14 @@
-"""Servidor Uber distribuído — um mês por nó, agregação via /summary."""
+"""Servidor FastAPI de um nó do cluster Uber NYC 2014.
+
+Cada processo atende uma porta (``SERVER_PORT``: 8001, 8002 ou 8003) e
+carrega apenas a partição mensal correspondente (abril, maio ou junho).
+
+Endpoints principais:
+
+* ``GET /local/summary`` — agrega só os registros deste nó.
+* ``GET /summary`` — coordena a consulta chamando ``/local/summary`` nos
+  vizinhos e mescla os resultados (sem ciclo de coordenação).
+"""
 
 from __future__ import annotations
 
@@ -9,7 +19,7 @@ import logging
 import os
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 from urllib.request import urlopen
 
 import httpx
@@ -19,13 +29,94 @@ from fastapi.responses import FileResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+
+# ── Tipos ─────────────────────────────────────────────────────────────────────
+
+class NodeConfig(TypedDict):
+    """Configuração estática de um nó do cluster."""
+
+    server_id: str
+    data_file: str
+    partition: str
+
+
+class PickupRecord(TypedDict):
+    """Registro de embarque carregado em memória."""
+
+    datetime: datetime
+    base: str
+
+
+class SummaryResult(TypedDict):
+    """Resumo numérico de embarques em um intervalo de datas."""
+
+    pickup_count: int
+    base_counts: dict[str, int]
+    first_pickup: Optional[str]
+    last_pickup: Optional[str]
+
+
+class HealthResponse(TypedDict):
+    """Resposta de ``GET /health``."""
+
+    status: str
+    server_id: str
+    partition: str
+    records: int
+
+
+class MetadataResponse(TypedDict):
+    """Resposta de ``GET /metadata``."""
+
+    server_id: str
+    owns: dict[str, str]
+    known_servers: list[str]
+
+
+class ClusterNodeStatus(TypedDict):
+    """Status de um nó reportado por ``GET /cluster/status``."""
+
+    url: str
+    server_id: Optional[str]
+    online: bool
+    self: bool
+    partition: Optional[str]
+
+
+class ClusterStatusResponse(TypedDict):
+    """Resposta de ``GET /cluster/status``."""
+
+    coordinator: str
+    nodes: list[ClusterNodeStatus]
+
+
+class LocalSummaryResponse(TypedDict):
+    """Resposta de ``GET /local/summary``."""
+
+    server_id: str
+    scope: str
+    complete: bool
+    result: SummaryResult
+
+
+class DistributedSummaryResponse(TypedDict):
+    """Resposta de ``GET /summary`` (consulta coordenada)."""
+
+    scope: str
+    coordinator: str
+    complete: bool
+    servers_contacted: list[str]
+    failed_servers: list[str]
+    result: SummaryResult
+
+
 # ── Cluster fixo (3 nós) ──────────────────────────────────────────────────────
 CSV_BASE = (
     "https://raw.githubusercontent.com/fivethirtyeight/uber-tlc-foil-response/"
     "master/uber-trip-data"
+ 
 )
-
-NODES = {
+NODES: dict[int, NodeConfig] = {
     8001: {
         "server_id": "servidor_01",
         "data_file": f"{CSV_BASE}/uber-raw-data-apr14.csv",
@@ -43,24 +134,30 @@ NODES = {
     },
 }
 
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8001"))
+SERVER_PORT: int = int(os.getenv("SERVER_PORT", "8001"))
 if SERVER_PORT not in NODES:
     raise SystemExit(f"SERVER_PORT inválida: {SERVER_PORT}. Use 8001, 8002 ou 8003.")
 
-NODE = NODES[SERVER_PORT]
-SERVER_ID = NODE["server_id"]
-KNOWN_SERVERS = [f"http://localhost:{p}" for p in NODES if p != SERVER_PORT]
-HTTP_TIMEOUT = 10.0
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+NODE: NodeConfig = NODES[SERVER_PORT]
+SERVER_ID: str = NODE["server_id"]
+KNOWN_SERVERS: list[str] = [f"http://localhost:{p}" for p in NODES if p != SERVER_PORT]
+HTTP_TIMEOUT: float = 10.0
+STATIC_DIR: Path = Path(__file__).resolve().parent.parent / "static"
 
-PICKUP_CSV_FMT = "%m/%d/%Y %H:%M:%S"
-PICKUP_DISPLAY_FMT = "%d/%m/%Y %H:%M:%S"
+PICKUP_CSV_FMT: str = "%m/%d/%Y %H:%M:%S"
+PICKUP_DISPLAY_FMT: str = "%d/%m/%Y %H:%M:%S"
 
 app = FastAPI(title=f"Uber Distributed — {SERVER_ID}", version="2.0.0")
-records: list[dict[str, Any]] = []
+records: list[PickupRecord] = []
 
 
 def load_data() -> None:
+    """Carrega o CSV da partição deste nó em ``records``.
+
+    Aceita URL HTTP (download) ou caminho local em ``NODE["data_file"]``.
+    Linhas com data inválida ou coluna ausente são ignoradas.
+    Em caso de falha de I/O, registra o erro e deixa ``records`` vazio.
+    """
     global records
     records = []
     source = NODE["data_file"]
@@ -92,13 +189,40 @@ def load_data() -> None:
 
 
 def parse_date(value: str, name: str) -> date:
+    """Converte string ``YYYY-MM-DD`` em :class:`~datetime.date`.
+
+    Args:
+        value: Data no formato ISO ``YYYY-MM-DD``.
+        name: Nome do parâmetro (usado na mensagem de erro).
+
+    Returns:
+        Objeto :class:`~datetime.date` correspondente.
+
+    Raises:
+        HTTPException: Se o formato for inválido (status 400).
+    """
     try:
         return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(400, f"Formato inválido para '{name}'. Use YYYY-MM-DD.")
 
 
-def summarize(start: date, end: date, base: Optional[str] = None) -> dict:
+def summarize(
+    start: date,
+    end: date,
+    base: Optional[str] = None,
+) -> SummaryResult:
+    """Conta embarques locais no intervalo ``[start, end]``.
+
+    Args:
+        start: Data inicial (inclusiva).
+        end: Data final (inclusiva).
+        base: Se informado, filtra pela coluna Base do CSV.
+
+    Returns:
+        Contagem total, contagens por base e timestamps do primeiro/último
+        embarque no formato de exibição ``PICKUP_DISPLAY_FMT``.
+    """
     count = 0
     base_counts: dict[str, int] = {}
     first_dt: Optional[datetime] = None
@@ -126,7 +250,18 @@ def summarize(start: date, end: date, base: Optional[str] = None) -> dict:
     }
 
 
-def merge_results(parts: list[dict]) -> dict:
+def merge_results(parts: list[SummaryResult]) -> SummaryResult:
+    """Mescla vários :class:`SummaryResult` em um único resumo agregado.
+
+    Soma ``pickup_count`` e ``base_counts``; escolhe o menor ``first_pickup``
+    e o maior ``last_pickup`` entre as partes.
+
+    Args:
+        parts: Lista de resumos parciais (local + vizinhos).
+
+    Returns:
+        Resumo consolidado com os mesmos campos de :class:`SummaryResult`.
+    """
     total = 0
     base_counts: dict[str, int] = {}
     first_dt: Optional[datetime] = None
@@ -159,11 +294,17 @@ def merge_results(parts: list[dict]) -> dict:
 
 @app.on_event("startup")
 def startup() -> None:
+    """Hook de startup: carrega a partição CSV deste nó."""
     load_data()
 
 
 @app.get("/", include_in_schema=False)
-def home():
+def home() -> FileResponse:
+    """Serve a interface web estática (``static/index.html``).
+
+    Raises:
+        HTTPException: Se o arquivo HTML não existir (status 404).
+    """
     path = STATIC_DIR / "index.html"
     if not path.exists():
         raise HTTPException(404, "static/index.html não encontrado")
@@ -171,7 +312,8 @@ def home():
 
 
 @app.get("/health")
-def health():
+def health() -> HealthResponse:
+    """Retorna status do nó, partição e quantidade de registros em memória."""
     return {
         "status": "ok",
         "server_id": SERVER_ID,
@@ -181,7 +323,8 @@ def health():
 
 
 @app.get("/metadata")
-def metadata():
+def metadata() -> MetadataResponse:
+    """Retorna metadados do nó e URLs dos servidores conhecidos."""
     return {
         "server_id": SERVER_ID,
         "owns": {
@@ -192,8 +335,13 @@ def metadata():
 
 
 @app.get("/cluster/status")
-async def cluster_status():
-    nodes: list[dict[str, Any]] = [
+async def cluster_status() -> ClusterStatusResponse:
+    """Sonda ``/health`` nos vizinhos e monta o panorama do cluster.
+
+    O nó atual é sempre marcado como online; falhas de rede nos vizinhos
+    aparecem com ``online: false``.
+    """
+    nodes: list[ClusterNodeStatus] = [
         {
             "url": f"http://localhost:{SERVER_PORT}",
             "server_id": SERVER_ID,
@@ -203,7 +351,8 @@ async def cluster_status():
         }
     ]
 
-    async def probe(server_url: str):
+    async def probe(server_url: str) -> ClusterNodeStatus:
+        """Consulta ``/health`` de um vizinho e devolve o status tipado."""
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
                 health_resp = await client.get(f"{server_url.rstrip('/')}/health")
@@ -235,7 +384,17 @@ def local_summary(
     start_date: str = Query(..., description="YYYY-MM-DD"),
     end_date: str = Query(..., description="YYYY-MM-DD"),
     base: Optional[str] = Query(None),
-):
+) -> LocalSummaryResponse:
+    """Resume embarques apenas com dados locais deste nó.
+
+    Args:
+        start_date: Data inicial no formato ``YYYY-MM-DD``.
+        end_date: Data final no formato ``YYYY-MM-DD``.
+        base: Filtro opcional pela base TLC.
+
+    Raises:
+        HTTPException: Datas inválidas ou ``start_date`` > ``end_date``.
+    """
     start, end = parse_date(start_date, "start_date"), parse_date(end_date, "end_date")
     if start > end:
         raise HTTPException(400, "start_date não pode ser maior que end_date.")
@@ -253,7 +412,21 @@ async def distributed_summary(
     start_date: str = Query(...),
     end_date: str = Query(...),
     base: Optional[str] = Query(None),
-):
+) -> DistributedSummaryResponse:
+    """Coordena consulta distribuída agregando ``/local/summary`` dos vizinhos.
+
+    Calcula o resumo local, solicita o mesmo intervalo aos nós em
+    ``KNOWN_SERVERS`` e mescla com :func:`merge_results`. Vizinhos
+    inacessíveis entram em ``failed_servers`` e ``complete`` fica ``False``.
+
+    Args:
+        start_date: Data inicial no formato ``YYYY-MM-DD``.
+        end_date: Data final no formato ``YYYY-MM-DD``.
+        base: Filtro opcional pela base TLC.
+
+    Raises:
+        HTTPException: Datas inválidas ou ``start_date`` > ``end_date``.
+    """
     start, end = parse_date(start_date, "start_date"), parse_date(end_date, "end_date")
     if start > end:
         raise HTTPException(400, "start_date não pode ser maior que end_date.")
@@ -263,11 +436,19 @@ async def distributed_summary(
         params["base"] = base
 
     local = summarize(start, end, base)
-    contacted = [SERVER_ID]
+    contacted: list[str] = [SERVER_ID]
     failed: list[str] = []
-    parts = [local]
+    parts: list[SummaryResult] = [local]
 
-    async def fetch(url: str):
+    async def fetch(
+        url: str,
+    ) -> tuple[Optional[SummaryResult], str, Optional[str]]:
+        """Busca ``/local/summary`` em ``url``.
+
+        Returns:
+            Tupla ``(resultado, referência_do_servidor, erro)``. Em sucesso
+            ``erro`` é ``None``; em falha ``resultado`` é ``None``.
+        """
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 r = await client.get(f"{url.rstrip('/')}/local/summary", params=params)
@@ -280,12 +461,13 @@ async def distributed_summary(
     for result, server_ref, err in await asyncio.gather(*[fetch(u) for u in KNOWN_SERVERS]):
         if err or result is None:
             # tenta nome amigável pela porta conhecida
-            port = None
+            port: Optional[int] = None
             try:
                 port = int(server_ref.rstrip("/").rsplit(":", 1)[-1])
             except ValueError:
                 pass
-            name = NODES.get(port, {}).get("server_id", server_ref) if port else server_ref
+            node_cfg = NODES.get(port) if port is not None else None
+            name = node_cfg["server_id"] if node_cfg else server_ref
             failed.append(name)
         else:
             contacted.append(server_ref)

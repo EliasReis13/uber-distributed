@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Sobe / para o cluster Uber (3 servidores).
 
-  python start.py       # sobe 8001–8003
-  python start.py stop  # encerra
-  python start.py 1     # sobe só o servidor 01
+Uso
+---
+::
+
+    python start.py       # sobe 8001–8003
+    python start.py stop  # encerra
+    python start.py 1     # sobe só o servidor 01
 """
 
 from __future__ import annotations
@@ -15,11 +19,21 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-PORTS = [8001, 8002, 8003]
+ROOT: Path = Path(__file__).resolve().parent
+PORTS: list[int] = [8001, 8002, 8003]
 
 
 def pid_on_port(port: int) -> int | None:
+    """Retorna o PID do processo em escuta na ``port``, ou ``None``.
+
+    No Windows usa ``netstat -ano``; em Unix usa ``lsof -ti tcp:<port>``.
+
+    Args:
+        port: Porta TCP a inspecionar.
+
+    Returns:
+        PID do listener, se encontrado; caso contrário ``None``.
+    """
     if sys.platform == "win32":
         try:
             out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
@@ -44,7 +58,11 @@ def pid_on_port(port: int) -> int | None:
 
 
 def stop_all() -> None:
-    killed = []
+    """Encerra processos nas portas do cluster (8001–8003).
+
+    Windows: ``taskkill /F``. Unix: ``SIGTERM``.
+    """
+    killed: list[int] = []
     for port in PORTS:
         pid = pid_on_port(port)
         if pid is None:
@@ -64,7 +82,20 @@ def stop_all() -> None:
         print(f"Encerrados {len(killed)} processo(s).")
 
 
-def start_one(port: int, *, foreground: bool = False) -> subprocess.Popen | None:
+def start_one(port: int, *, foreground: bool = False) -> subprocess.Popen[bytes] | None:
+    """Inicia um nó uvicorn na porta indicada.
+
+    Define ``SERVER_PORT`` no ambiente do subprocesso. Se a porta já estiver
+    em uso, apenas registra e retorna ``None``.
+
+    Args:
+        port: Porta do nó (8001, 8002 ou 8003).
+        foreground: Se ``True``, bloqueia no processo (útil para um nó só);
+            se ``False``, sobe em background via :class:`subprocess.Popen`.
+
+    Returns:
+        Handle do processo em background, ou ``None`` se pulou / foreground.
+    """
     existing = pid_on_port(port)
     if existing is not None:
         print(f"  porta {port} já em uso (PID {existing}) — pulando")
@@ -74,7 +105,7 @@ def start_one(port: int, *, foreground: bool = False) -> subprocess.Popen | None
     env["SERVER_PORT"] = str(port)
     env.setdefault("PYTHONUNBUFFERED", "1")
 
-    cmd = [
+    cmd: list[str] = [
         sys.executable, "-m", "uvicorn", "server.app:app",
         "--host", "0.0.0.0", "--port", str(port), "--log-level", "info",
     ]
@@ -87,13 +118,20 @@ def start_one(port: int, *, foreground: bool = False) -> subprocess.Popen | None
 
 
 def start_all() -> None:
+    """Sobe os três nós e aguarda até Ctrl+C ou término dos processos.
+
+    Se alguma porta do cluster já estiver ocupada, chama :func:`stop_all`
+    antes de reiniciar.
+    """
     if any(pid_on_port(p) for p in PORTS):
         print("Liberando portas ocupadas…")
         stop_all()
         time.sleep(1)
 
     print("Iniciando cluster (3 servidores)…\n")
-    procs = [p for p in (start_one(port) for port in PORTS) if p is not None]
+    procs: list[subprocess.Popen[bytes]] = [
+        p for p in (start_one(port) for port in PORTS) if p is not None
+    ]
 
     print("\nPronto. Interface: http://localhost:8001/")
     print("Para encerrar: python start.py stop   (ou Ctrl+C)\n")
@@ -117,6 +155,7 @@ def start_all() -> None:
 
 
 def main() -> None:
+    """CLI: sem args sobe o cluster; ``stop`` / ``1``|``2``|``3`` / ``help``."""
     os.chdir(ROOT)
     args = sys.argv[1:]
 
