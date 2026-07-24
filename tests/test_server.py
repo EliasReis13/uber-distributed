@@ -113,3 +113,30 @@ def test_distributed_summary_query_field() -> None:
     assert query["start_date"] == "2014-04-01"
     assert query["end_date"] == "2014-04-30"
     assert query["base"] == "B02512"
+
+
+def test_local_insights_structure() -> None:
+    """``GET /local/insights`` retorna by_hour, by_weekday e top_zones tipados."""
+    r = get("/local/insights", start_date="2014-04-01", end_date="2014-04-30")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["scope"] == "local"
+    result = data["result"]
+    assert isinstance(result["by_hour"], dict)
+    assert isinstance(result["by_weekday"], dict)
+    assert isinstance(result["top_zones"], list)
+    if result["top_zones"]:
+        zone = result["top_zones"][0]
+        assert "lat" in zone and "lon" in zone and "count" in zone
+
+
+def test_distributed_insights() -> None:
+    """``GET /insights`` retorna escopo distribuído e coordenador."""
+    r = get("/insights", start_date="2014-04-01", end_date="2014-04-30")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["scope"] == "distributed"
+    assert "coordinator" in data
+    assert "result" in data
+    assert "by_hour" in data["result"]
+    assert "top_zones" in data["result"]
