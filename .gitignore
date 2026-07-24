@@ -1,0 +1,48 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Environment / secrets (keep config/servidor_*.env tracked)
+.env
+.env.*
+!.env.example
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and local data dumps
+*.log
+data/*.csv
+!data/.gitkeep

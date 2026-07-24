@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Uber Distributed · Consultas</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #12141a;
+      --muted: #5c6478;
+      --line: #d8dde8;
+      --paper: #f3f5f9;
+      --panel: #ffffff;
+      --accent: #0f766e;
+      --accent-soft: #ccfbf1;
+      --warn: #b45309;
+      --warn-soft: #ffedd5;
+      --bad: #b91c1c;
+      --bad-soft: #fee2e2;
+      --ok: #047857;
+      --ok-soft: #d1fae5;
+      --taxi: #eab308;
+      --shadow: 0 1px 0 rgba(18, 20, 26, 0.04);
+      --radius: 14px;
+      --font-display: "Syne", sans-serif;
+      --font-body: "Manrope", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      font-family: var(--font-body);
+      color: var(--ink);
+      background:
+        radial-gradient(ellipse 80% 50% at 10% -10%, #dbeafe 0%, transparent 55%),
+        radial-gradient(ellipse 60% 40% at 100% 0%, #ccfbf1 0%, transparent 50%),
+        linear-gradient(180deg, #eef1f7 0%, var(--paper) 40%, #e8ecf4 100%);
+      background-attachment: fixed;
+    }
+
+    .grid-bg {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.35;
+      background-image:
+        linear-gradient(rgba(18, 20, 26, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(18, 20, 26, 0.04) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: linear-gradient(180deg, #000 0%, transparent 85%);
+    }
+
+    .wrap {
+      position: relative;
+      width: min(1120px, calc(100% - 2rem));
+      margin: 0 auto;
+      padding: 2rem 0 4rem;
+    }
+
+    header.hero {
+      display: grid;
+      gap: 1.25rem;
+      margin-bottom: 2rem;
+      animation: rise 0.6s ease both;
+    }
+
+    .brand-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+    }
+
+    .mark {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: var(--ink);
+      display: grid;
+      place-items: center;
+      flex-shrink: 0;
+    }
+
+    .mark span {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--taxi);
+      box-shadow: 10px 0 0 -4px var(--accent), -10px 0 0 -4px #38bdf8;
+    }
+
+    .brand h1 {
+      font-family: var(--font-display);
+      font-size: clamp(1.6rem, 3vw, 2.15rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin: 0;
+      line-height: 1.05;
+    }
+
+    .brand p {
+      margin: 0.2rem 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .server-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.55rem 0.9rem;
+      border-radius: 999px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      font-size: 0.85rem;
+      font-weight: 600;
+      box-shadow: var(--shadow);
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--ok);
+      box-shadow: 0 0 0 3px var(--ok-soft);
+    }
+
+    .dot.off { background: var(--bad); box-shadow: 0 0 0 3px var(--bad-soft); }
+
+    h2 {
+      font-family: var(--font-display);
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin: 0 0 0.85rem;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.35rem;
+      box-shadow: var(--shadow);
+      animation: rise 0.7s ease both;
+    }
+
+    .panel + .panel, .stack > * + * { margin-top: 1rem; }
+
+    .cluster {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 0.75rem;
+    }
+
+    .node {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 0.85rem 0.9rem;
+      background: #fafbfd;
+      transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+
+    .node:hover { transform: translateY(-2px); }
+    .node.online { border-color: #99f6e4; background: linear-gradient(180deg, #f0fdfa, #fff); }
+    .node.offline { border-color: #fecaca; background: linear-gradient(180deg, #fef2f2, #fff); }
+    .node.self { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+    .node .id {
+      font-weight: 700;
+      font-size: 0.88rem;
+      margin-bottom: 0.2rem;
+    }
+
+    .node .meta {
+      color: var(--muted);
+      font-size: 0.75rem;
+      line-height: 1.35;
+    }
+
+    .node .status {
+      margin-top: 0.55rem;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .node.online .status { color: var(--ok); }
+    .node.offline .status { color: var(--bad); }
+
+    form.query {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .fields {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.85rem;
+    }
+
+    @media (max-width: 840px) {
+      .fields { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 520px) {
+      .fields { grid-template-columns: 1fr; }
+    }
+
+    label {
+      display: grid;
+      gap: 0.35rem;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    input, select {
+      font: inherit;
+      color: var(--ink);
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.7rem 0.8rem;
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    input:focus, select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+      background: #fff;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      align-items: center;
+    }
+
+    button {
+      font: inherit;
+      font-weight: 700;
+      border: none;
+      border-radius: 999px;
+      padding: 0.75rem 1.25rem;
+      cursor: pointer;
+      transition: transform 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+    }
+
+    button:active { transform: scale(0.98); }
+    button:disabled { opacity: 0.55; cursor: wait; }
+
+    .btn-primary {
+      background: var(--ink);
+      color: #fff;
+    }
+
+    .btn-primary:hover { background: #1f2430; }
+
+    .btn-secondary {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--line);
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .results { display: none; }
+    .results.show { display: block; animation: rise 0.45s ease both; }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.75rem;
+      margin-bottom: 1.1rem;
+    }
+
+    @media (max-width: 840px) {
+      .metrics { grid-template-columns: 1fr 1fr; }
+    }
+
+    .metric {
+      border-radius: 12px;
+      padding: 1rem;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+    }
+
+    .metric .label {
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+
+    .metric .value {
+      font-family: var(--font-display);
+      font-size: clamp(1.35rem, 2.5vw, 1.85rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-top: 0.35rem;
+      line-height: 1.1;
+    }
+
+    .metric .sub {
+      margin-top: 0.35rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+    }
+
+    .badge.ok { background: var(--ok-soft); color: var(--ok); }
+    .badge.warn { background: var(--warn-soft); color: var(--warn); }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 1rem;
+    }
+
+    @media (max-width: 840px) {
+      .two-col { grid-template-columns: 1fr; }
+    }
+
+    .bars { display: grid; gap: 0.65rem; }
+
+    .bar-row {
+      display: grid;
+      grid-template-columns: 70px 1fr 70px;
+      gap: 0.65rem;
+      align-items: center;
+      font-size: 0.82rem;
+    }
+
+    .bar-track {
+      height: 10px;
+      border-radius: 999px;
+      background: #e8edf5;
+      overflow: hidden;
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--accent), #0ea5e9);
+      width: 0;
+      transition: width 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    .bar-row .code { font-weight: 700; }
+    .bar-row .n { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+    }
+
+    .chip {
+      font-size: 0.78rem;
+      font-weight: 600;
+      padding: 0.4rem 0.7rem;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .chip.ok { background: var(--ok-soft); border-color: #a7f3d0; color: var(--ok); }
+    .chip.bad { background: var(--bad-soft); border-color: #fecaca; color: var(--bad); }
+
+    .meta-line {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1.25rem;
+      margin-top: 1rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .meta-line strong { color: var(--ink); font-weight: 700; }
+
+    .error {
+      display: none;
+      margin-top: 1rem;
+      padding: 0.85rem 1rem;
+      border-radius: 12px;
+      background: var(--bad-soft);
+      color: var(--bad);
+      border: 1px solid #fecaca;
+      font-size: 0.9rem;
+    }
+
+    .error.show { display: block; }
+
+    footer {
+      margin-top: 2rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-align: center;
+    }
+
+    footer a { color: var(--accent); font-weight: 600; text-decoration: none; }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="grid-bg" aria-hidden="true"></div>
+  <div class="wrap">
+    <header class="hero">
+      <div class="brand-row">
+        <div class="brand">
+          <div class="mark" aria-hidden="true"><span></span></div>
+          <div>
+            <h1>Uber Distributed</h1>
+            <p>Consultas agregadas sobre pickups NYC · 2014</p>
+          </div>
+        </div>
+        <div class="server-pill" id="localPill">
+          <span class="dot" id="localDot"></span>
+          <span id="localLabel">conectando…</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="panel stack">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+        <h2 style="margin:0">Cluster</h2>
+        <button type="button" class="btn-ghost" id="refreshCluster">Atualizar status</button>
+      </div>
+      <div class="cluster" id="cluster" style="margin-top:0.85rem"></div>
+    </section>
+
+    <section class="panel" style="margin-top:1rem">
+      <h2>Consulta</h2>
+      <form class="query" id="queryForm">
+        <div class="fields">
+          <label>
+            Data inicial
+            <input type="date" name="start_date" value="2014-04-01" required />
+          </label>
+          <label>
+            Data final
+            <input type="date" name="end_date" value="2014-06-30" required />
+          </label>
+          <label>
+            Base (opcional)
+            <input type="text" name="base" placeholder="ex: B02512" />
+          </label>
+          <label>
+            Escopo
+            <select name="scope">
+              <option value="distributed">Distribuído (/summary)</option>
+              <option value="local">Somente local (/local/summary)</option>
+            </select>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="submit" class="btn-primary" id="runBtn">Executar consulta</button>
+          <button type="button" class="btn-secondary" id="presetAprJun">Abr–Jun (3 meses)</button>
+          <button type="button" class="btn-ghost" id="presetApr">Só abril</button>
+          <span class="hint">O coordenador chama <code>/local/summary</code> nos demais nós.</span>
+        </div>
+      </form>
+      <div class="error" id="errorBox"></div>
+    </section>
+
+    <section class="panel results" id="results" style="margin-top:1rem">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:0.85rem;">
+        <h2 style="margin:0">Resultado</h2>
+        <span class="badge" id="completeBadge"></span>
+      </div>
+
+      <div class="metrics">
+        <div class="metric">
+          <div class="label">Pickups</div>
+          <div class="value" id="pickupCount">—</div>
+          <div class="sub" id="scopeLabel"></div>
+        </div>
+        <div class="metric">
+          <div class="label">Bases</div>
+          <div class="value" id="baseCount">—</div>
+          <div class="sub">códigos distintos</div>
+        </div>
+        <div class="metric">
+          <div class="label">Primeiro</div>
+          <div class="value" style="font-size:1.05rem" id="firstPickup">—</div>
+        </div>
+        <div class="metric">
+          <div class="label">Último</div>
+          <div class="value" style="font-size:1.05rem" id="lastPickup">—</div>
+        </div>
+      </div>
+
+      <div class="two-col">
+        <div>
+          <h2>Contagem por base</h2>
+          <div class="bars" id="bars"></div>
+        </div>
+        <div>
+          <h2>Servidores</h2>
+          <p class="hint" style="margin-top:0">Contactados</p>
+          <div class="chips" id="contacted" style="margin:0.5rem 0 1rem"></div>
+          <p class="hint">Falhas</p>
+          <div class="chips" id="failed" style="margin-top:0.5rem"></div>
+        </div>
+      </div>
+
+      <div class="meta-line" id="metaLine"></div>
+    </section>
+
+    <footer>
+      UNEB · LPIII ·
+      <a href="/docs" target="_blank" rel="noopener">Swagger /docs</a>
+    </footer>
+  </div>
+
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+
+    function fmt(n) {
+      return Number(n || 0).toLocaleString("pt-BR");
+    }
+
+    /** YYYY-MM-DD → DD/MM/YYYY */
+    function fmtDate(iso) {
+      if (!iso) return "—";
+      const [y, m, d] = String(iso).split("-");
+      if (!y || !m || !d) return iso;
+      return `${d}/${m}/${y}`;
+    }
+
+    function shortServer(ref) {
+      if (!ref) return "—";
+      if (ref.startsWith("http")) {
+        try {
+          const u = new URL(ref);
+          return u.port ? `:${u.port}` : u.hostname;
+        } catch {
+          return ref;
+        }
+      }
+      return ref;
+    }
+
+    async function loadLocal() {
+      try {
+        const [health, meta] = await Promise.all([
+          fetch("/health").then((r) => r.json()),
+          fetch("/metadata").then((r) => r.json()),
+        ]);
+        $("#localDot").classList.remove("off");
+        $("#localLabel").textContent = `${health.server_id} · este nó`;
+        return { health, meta };
+      } catch (err) {
+        $("#localDot").classList.add("off");
+        $("#localLabel").textContent = "servidor offline";
+        throw err;
+      }
+    }
+
+    async function loadCluster() {
+      const box = $("#cluster");
+      box.innerHTML = `<div class="hint">Verificando nós…</div>`;
+      try {
+        const data = await fetch("/cluster/status").then((r) => r.json());
+        box.innerHTML = "";
+        for (const node of data.nodes) {
+          const el = document.createElement("div");
+          el.className = `node ${node.online ? "online" : "offline"}${node.self ? " self" : ""}`;
+          el.innerHTML = `
+            <div class="id">${node.server_id || shortServer(node.url)}</div>
+            <div class="meta">${node.self ? "coordenador atual" : shortServer(node.url)}
+              ${node.partition ? `<br>${node.partition}` : ""}
+            </div>
+            <div class="status">${node.online ? "online" : "offline"}</div>
+          `;
+          box.appendChild(el);
+        }
+      } catch (err) {
+        box.innerHTML = `<div class="hint">Não foi possível carregar o cluster.</div>`;
+      }
+    }
+
+    function renderResult(data) {
+      const result = data.result || {};
+      const bases = Object.entries(result.base_counts || {}).sort((a, b) => b[1] - a[1]);
+      const max = bases.length ? bases[0][1] : 0;
+
+      $("#results").classList.add("show");
+      $("#pickupCount").textContent = fmt(result.pickup_count);
+      $("#baseCount").textContent = fmt(bases.length);
+      $("#firstPickup").textContent = result.first_pickup || "—";
+      $("#lastPickup").textContent = result.last_pickup || "—";
+      $("#scopeLabel").textContent =
+        data.scope === "distributed"
+          ? `agregado · coord. ${data.coordinator || "—"}`
+          : `local · ${data.server_id || "—"}`;
+
+      const badge = $("#completeBadge");
+      if (data.scope === "local" || data.complete) {
+        badge.className = "badge ok";
+        badge.textContent = "complete: true";
+      } else {
+        badge.className = "badge warn";
+        badge.textContent = "complete: false";
+      }
+
+      const bars = $("#bars");
+      bars.innerHTML = "";
+      if (!bases.length) {
+        bars.innerHTML = `<div class="hint">Nenhum pickup no intervalo.</div>`;
+      } else {
+        for (const [code, count] of bases) {
+          const row = document.createElement("div");
+          row.className = "bar-row";
+          const pct = max ? Math.round((count / max) * 100) : 0;
+          row.innerHTML = `
+            <div class="code">${code}</div>
+            <div class="bar-track"><div class="bar-fill" style="width:0%"></div></div>
+            <div class="n">${fmt(count)}</div>
+          `;
+          bars.appendChild(row);
+          requestAnimationFrame(() => {
+            row.querySelector(".bar-fill").style.width = `${pct}%`;
+          });
+        }
+      }
+
+      const contacted = data.servers_contacted || [data.server_id].filter(Boolean);
+      const failed = data.failed_servers || [];
+      $("#contacted").innerHTML = contacted
+        .map((s) => `<span class="chip ok">${shortServer(s)}</span>`)
+        .join("") || `<span class="hint">—</span>`;
+      $("#failed").innerHTML = failed.length
+        ? failed.map((s) => `<span class="chip bad">${shortServer(s)}</span>`).join("")
+        : `<span class="chip ok">nenhuma</span>`;
+
+      const bits = [];
+      if (data.trace_id) bits.push(`<span>trace <strong>${data.trace_id}</strong></span>`);
+      if (data.query) {
+        bits.push(
+          `<span>período <strong>${fmtDate(data.query.start_date)} → ${fmtDate(data.query.end_date)}</strong></span>`
+        );
+        if (data.query.base) bits.push(`<span>base <strong>${data.query.base}</strong></span>`);
+      }
+      $("#metaLine").innerHTML = bits.join("");
+    }
+
+    async function runQuery(ev) {
+      ev?.preventDefault();
+      const form = $("#queryForm");
+      const fd = new FormData(form);
+      const start = fd.get("start_date");
+      const end = fd.get("end_date");
+      const base = String(fd.get("base") || "").trim();
+      const scope = fd.get("scope");
+
+      const params = new URLSearchParams({ start_date: start, end_date: end });
+      if (base) params.set("base", base);
+
+      const path = scope === "local" ? "/local/summary" : "/summary";
+      const btn = $("#runBtn");
+      const err = $("#errorBox");
+      err.classList.remove("show");
+      btn.disabled = true;
+      btn.textContent = "Consultando…";
+
+      try {
+        const res = await fetch(`${path}?${params}`);
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || JSON.stringify(data));
+        }
+        renderResult(data);
+      } catch (e) {
+        err.textContent = String(e.message || e);
+        err.classList.add("show");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Executar consulta";
+      }
+    }
+
+    $("#queryForm").addEventListener("submit", runQuery);
+    $("#refreshCluster").addEventListener("click", loadCluster);
+    $("#presetAprJun").addEventListener("click", () => {
+      const f = $("#queryForm");
+      f.start_date.value = "2014-04-01";
+      f.end_date.value = "2014-06-30";
+      f.scope.value = "distributed";
+    });
+    $("#presetApr").addEventListener("click", () => {
+      const f = $("#queryForm");
+      f.start_date.value = "2014-04-01";
+      f.end_date.value = "2014-04-30";
+      f.scope.value = "local";
+    });
+
+    (async () => {
+      try {
+        await loadLocal();
+        await loadCluster();
+      } catch (_) {
+        /* pill already updated */
+      }
+    })();
+  </script>
+</body>
+</html>
