@@ -112,13 +112,16 @@ uber-distributed/
 
 | Rota                 | O que faz                                        |
 | -------------------- | ------------------------------------------------ |
-| `GET /health`        | Status do nó                                     |
-| `GET /metadata`      | Intervalo de dados do nó e servidores conhecidos |
-| `GET /local/summary` | Só dados locais                                  |
-| `GET /summary`       | Agrega os 6 nós                                  |
-
+| `GET /health` | Status do nó |
+| `GET /metadata` | Intervalo de dados do nó e servidores conhecidos |
+| `GET /local/summary` | Só dados locais |
+| `GET /summary` | Agrega os 6 nós |
+| `GET /local/insights` | Cruza hora do dia, dia da semana e zona geográfica (Lat/Lon) — só neste nó |
+| `GET /insights` | Mesmos cruzamentos, agregados entre os nós relevantes |
 
 Parâmetros: `start_date`, `end_date` (obrigatórios) e `base` (opcional).
+
+Os endpoints `/local/insights` e `/insights` apoiam decisões de negócio (alocação de motoristas, precificação dinâmica, posicionamento de frota) e **não** substituem os endpoints obrigatórios do PDF.
 
 ```bash
 curl http://localhost:8001/health
@@ -239,11 +242,12 @@ Sim: **cada grupo configura os IPs dos outros servidores** na variável `KNOWN_S
 
 ## Como funciona
 
-1. Cada servidor guarda **só o seu mês** em um arquivo SQLite em disco (`data/servidor_XX.db`), indexado por data.
-2. Na **primeira** subida o CSV é baixado e importado; nas seguintes o `.db` é reaproveitado (startup bem mais rápido).
+1. Cada servidor guarda **só o seu mês** em um arquivo SQLite em disco (`data/servidor_XX.db`), indexado por data, com `Date/Time`, `Base`, `Lat` e `Lon`.
+2. Na **primeira** subida o CSV é baixado e importado; nas seguintes o `.db` é reaproveitado (startup bem mais rápido). Se o `.db` for de um schema antigo (sem `lat`/`lon`), a próxima subida **reimporta automaticamente**.
 3. `/local/summary` conta só neste nó, com uma consulta SQL indexada.
 4. `/summary` contata só os vizinhos cujo mês se sobrepõe ao intervalo pedido (decidido localmente, sem chamada de rede extra), agrega via `/local/summary` (sem ciclo) e devolve o `query` recebido junto com o resultado.
-5. Vizinho fora do ar → `failed_servers` e `"complete": false`.
+5. `/local/insights` e `/insights` cruzam hora do dia, dia da semana e zonas geográficas (~1,1 km) para a seção Insights da interface.
+6. Vizinho fora do ar → `failed_servers` e `"complete": false`.
 
 
 
