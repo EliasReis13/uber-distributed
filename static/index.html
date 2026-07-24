@@ -458,6 +458,7 @@
           <span id="localLabel">conectando…</span>
         </div>
       </div>
+      <p class="hint" id="partitionHint" style="margin:0"></p>
     </header>
 
     <section class="panel stack">
@@ -478,7 +479,7 @@
           </label>
           <label>
             Data final
-            <input type="date" name="end_date" value="2014-06-30" required />
+            <input type="date" name="end_date" value="2014-09-30" required />
           </label>
           <label>
             Base (opcional)
@@ -494,15 +495,15 @@
         </div>
         <div class="actions">
           <button type="submit" class="btn-primary" id="runBtn">Executar consulta</button>
-          <button type="button" class="btn-secondary" id="presetAprJun">Abr–Jun (3 meses)</button>
+          <button type="button" class="btn-secondary" id="presetAprJun">Abr–Set (6 meses)</button>
           <button type="button" class="btn-ghost" id="presetApr">Só abril</button>
           <span class="hint">O coordenador chama <code>/local/summary</code> nos demais nós.</span>
         </div>
       </form>
-      <div class="error" id="errorBox"></div>
+      <div class="error" id="errorBox" role="alert"></div>
     </section>
 
-    <section class="panel results" id="results" style="margin-top:1rem">
+    <section class="panel results" id="results" style="margin-top:1rem" aria-live="polite">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:0.85rem;">
         <h2 style="margin:0">Resultado</h2>
         <span class="badge" id="completeBadge"></span>
@@ -555,6 +556,7 @@
   <script>
     const $ = (sel) => document.querySelector(sel);
 
+    /** Formata um número com separadores de milhar em pt-BR. */
     function fmt(n) {
       return Number(n || 0).toLocaleString("pt-BR");
     }
@@ -567,19 +569,44 @@
       return `${d}/${m}/${y}`;
     }
 
-    function shortServer(ref) {
-      if (!ref) return "—";
-      if (ref.startsWith("http")) {
-        try {
-          const u = new URL(ref);
-          return u.port ? `:${u.port}` : u.hostname;
-        } catch {
-          return ref;
-        }
-      }
-      return ref;
+    /** "YYYY-MM-DD HH:MM:SS" → "DD/MM/YYYY HH:MM:SS" (só para exibição; a API continua ISO) */
+    function fmtDateTime(value) {
+      if (!value) return "—";
+      const [datePart, timePart] = String(value).split(" ");
+      const dateFmt = fmtDate(datePart);
+      return timePart ? `${dateFmt} ${timePart}` : dateFmt;
     }
 
+    /** Extrai uma mensagem legível de um corpo de erro do FastAPI.
+     *  Em 422 o campo `detail` é uma lista de objetos {loc, msg, type}. */
+    function errorMessage(data) {
+      const detail = data?.detail;
+      if (typeof detail === "string") return detail;
+      if (Array.isArray(detail) && detail.length) {
+        return detail.map((d) => d.msg || JSON.stringify(d)).join("; ");
+      }
+      return JSON.stringify(data);
+    }
+
+    /** Reduz uma URL de servidor a um rótulo curto para exibição.
+     *  Localhost vira só ":porta"; hosts remotos (rede real, uma máquina
+     *  por servidor) viram "host:porta", para distinguir máquinas que
+     *  usem a mesma porta. */
+    function shortServer(ref) {
+      if (!ref) return "—";
+      if (!ref.startsWith("http")) return ref;
+      try {
+        const u = new URL(ref);
+        const isLocal = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+        if (isLocal) return u.port ? `:${u.port}` : u.hostname;
+        return u.port ? `${u.hostname}:${u.port}` : u.hostname;
+      } catch {
+        return ref;
+      }
+    }
+
+    /** Carrega `/health` e `/metadata` deste nó e atualiza o cabeçalho
+     *  (pill de status + dica de partição). Lança se o nó estiver offline. */
     async function loadLocal() {
       try {
         const [health, meta] = await Promise.all([
@@ -588,6 +615,10 @@
         ]);
         $("#localDot").classList.remove("off");
         $("#localLabel").textContent = `${health.server_id} · este nó`;
+        const owns = meta.owns || {};
+        $("#partitionHint").textContent = owns.date_start
+          ? `Este nó guarda ${fmtDate(owns.date_start)} → ${fmtDate(owns.date_end)} (${owns.partition_description || ""})`
+          : "";
         return { health, meta };
       } catch (err) {
         $("#localDot").classList.add("off");
@@ -596,8 +627,18 @@
       }
     }
 
+    /** Consulta `/cluster/status` deste nó e renderiza um cartão por
+     *  servidor conhecido (online/offline, partição, se é o coordenador
+     *  atual). Também alterna o estado de carregamento do botão
+     *  "Atualizar status", quando presente. */
     async function loadCluster() {
       const box = $("#cluster");
+      const btn = $("#refreshCluster");
+      const prevLabel = btn ? btn.textContent : null;
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Atualizando…";
+      }
       box.innerHTML = `<div class="hint">Verificando nós…</div>`;
       try {
         const data = await fetch("/cluster/status").then((r) => r.json());
@@ -616,9 +657,17 @@
         }
       } catch (err) {
         box.innerHTML = `<div class="hint">Não foi possível carregar o cluster.</div>`;
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = prevLabel;
+        }
       }
     }
 
+    /** Preenche o painel de resultado (métricas, barras por base,
+     *  chips de servidores contactados/falhos e linha de metadados) a
+     *  partir da resposta de `/summary` ou `/local/summary`. */
     function renderResult(data) {
       const result = data.result || {};
       const bases = Object.entries(result.base_counts || {}).sort((a, b) => b[1] - a[1]);
@@ -627,8 +676,8 @@
       $("#results").classList.add("show");
       $("#pickupCount").textContent = fmt(result.pickup_count);
       $("#baseCount").textContent = fmt(bases.length);
-      $("#firstPickup").textContent = result.first_pickup || "—";
-      $("#lastPickup").textContent = result.last_pickup || "—";
+      $("#firstPickup").textContent = fmtDateTime(result.first_pickup);
+      $("#lastPickup").textContent = fmtDateTime(result.last_pickup);
       $("#scopeLabel").textContent =
         data.scope === "distributed"
           ? `agregado · coord. ${data.coordinator || "—"}`
@@ -674,7 +723,6 @@
         : `<span class="chip ok">nenhuma</span>`;
 
       const bits = [];
-      if (data.trace_id) bits.push(`<span>trace <strong>${data.trace_id}</strong></span>`);
       if (data.query) {
         bits.push(
           `<span>período <strong>${fmtDate(data.query.start_date)} → ${fmtDate(data.query.end_date)}</strong></span>`
@@ -684,6 +732,9 @@
       $("#metaLine").innerHTML = bits.join("");
     }
 
+    /** Handler de submit do formulário de consulta: monta os query params,
+     *  chama `/summary` ou `/local/summary` conforme o escopo escolhido e
+     *  renderiza o resultado (ou uma mensagem de erro legível). */
     async function runQuery(ev) {
       ev?.preventDefault();
       const form = $("#queryForm");
@@ -707,7 +758,7 @@
         const res = await fetch(`${path}?${params}`);
         const data = await res.json();
         if (!res.ok) {
-          throw new Error(data.detail || JSON.stringify(data));
+          throw new Error(errorMessage(data));
         }
         renderResult(data);
       } catch (e) {
@@ -724,7 +775,7 @@
     $("#presetAprJun").addEventListener("click", () => {
       const f = $("#queryForm");
       f.start_date.value = "2014-04-01";
-      f.end_date.value = "2014-06-30";
+      f.end_date.value = "2014-09-30";
       f.scope.value = "distributed";
     });
     $("#presetApr").addEventListener("click", () => {
