@@ -193,6 +193,46 @@ flowchart LR
 
 Se `KNOWN_SERVERS` não for definido, o servidor usa o padrão `localhost` (bom para testar os 6 nós juntos em uma única máquina, como na seção anterior).
 
+### Em sala de aula (um grupo por máquina)
+
+Sim: **cada grupo configura os IPs dos outros servidores** na variável `KNOWN_SERVERS`. Não existe descoberta automática — a lista é estática e precisa ser combinada entre os grupos.
+
+**Passo a passo em sala**
+
+1. Todo mundo na **mesma rede** (mesmo Wi‑Fi / mesma lab). Os IPs devem ficar na mesma sub-rede (ex.: todos `192.168.0.x`). Se um PC estiver em `192.168.0.x` e outro em `192.168.1.x`, em geral **não** se enxergam.
+2. Cada grupo anota o próprio IPv4 (`ipconfig` → "Endereço IPv4") e a porta do seu servidor.
+3. Combinam a lista (quadro, chat, etc.), por exemplo:
+
+   | Grupo | Servidor | Porta | IP (exemplo) |
+   |-------|----------|-------|--------------|
+   | A | servidor_01 (abril) | 8001 | 192.168.0.162 |
+   | B | servidor_02 (maio) | 8002 | 192.168.0.176 |
+   | C | servidor_03 (junho) | 8003 | 192.168.0.50 |
+   | … | … | … | … |
+
+4. Em **cada máquina**, monte `KNOWN_SERVERS` só com os **vizinhos** (não inclua o próprio IP) e suba **apenas** o nó do grupo:
+
+   ```powershell
+   # Exemplo — grupo do servidor 1 (abril), na máquina 192.168.0.162
+   $env:KNOWN_SERVERS = "http://192.168.0.176:8002,http://192.168.0.50:8003,http://192.168.0.51:8004,http://192.168.0.52:8005,http://192.168.0.53:8006"
+   python start.py 1
+   ```
+
+   ```powershell
+   # Exemplo — grupo do servidor 2 (maio), na máquina 192.168.0.176
+   $env:KNOWN_SERVERS = "http://192.168.0.162:8001,http://192.168.0.50:8003,http://192.168.0.51:8004,http://192.168.0.52:8005,http://192.168.0.53:8006"
+   python start.py 2
+   ```
+
+5. Liberem a porta no firewall de cada máquina.
+6. Testem a interface pelo IP do coordenador (ex.: `http://192.168.0.162:8001/`) com escopo **distribuído**. No painel Cluster, os vizinhos devem aparecer **online** e a consulta com `"complete": true`.
+
+**Dicas**
+
+- Se o IP mudar (DHCP / trocar de rede), atualize `KNOWN_SERVERS` e **reinicie** o `python start.py N`.
+- Comunicação só em um sentido (A → B funciona, B → A não) costuma ser IP errado na lista ou firewall bloqueando a porta de entrada.
+- Para validar um vizinho antes da consulta: `Invoke-WebRequest http://IP_DO_VIZINHO:PORTA/health`.
+
 ## Como funciona
 
 1. Cada servidor guarda **só o seu mês** em um arquivo SQLite em disco (`data/servidor_XX.db`), indexado por data.
