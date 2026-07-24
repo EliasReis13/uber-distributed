@@ -16,6 +16,8 @@ Endpoints principais:
 * ``GET /local/summary`` — agrega só os registros deste nó.
 * ``GET /summary`` — coordena a consulta chamando ``/local/summary`` nos
   vizinhos e mescla os resultados (sem ciclo de coordenação).
+* ``GET /local/insights`` / ``GET /insights`` — cruzamentos de hora do dia,
+  dia da semana e zona geográfica (Lat/Lon) para apoiar decisões de negócio.
 """
 
 from __future__ import annotations
@@ -69,6 +71,22 @@ class SummaryResult(TypedDict):
     base_counts: dict[str, int]
     first_pickup: Optional[str]
     last_pickup: Optional[str]
+
+
+class ZoneCount(TypedDict):
+    """Uma célula de grade geográfica (~1,1 km) e sua contagem de pickups."""
+
+    lat: float
+    lon: float
+    count: int
+
+
+class LocalInsightsResult(TypedDict):
+    """Cruzamento de hora do dia, dia da semana e zona geográfica."""
+
+    by_hour: dict[str, int]
+    by_weekday: dict[str, int]
+    top_zones: list[ZoneCount]
 
 
 class HealthResponse(TypedDict):
@@ -140,6 +158,27 @@ class DistributedSummaryResponse(TypedDict):
     servers_contacted: list[str]
     failed_servers: list[str]
     result: SummaryResult
+
+
+class LocalInsightsResponse(TypedDict):
+    """Resposta de ``GET /local/insights``."""
+
+    server_id: str
+    scope: str
+    complete: bool
+    result: LocalInsightsResult
+
+
+class InsightsResponse(TypedDict):
+    """Resposta de ``GET /insights`` (versão distribuída)."""
+
+    scope: str
+    coordinator: str
+    query: SummaryQuery
+    complete: bool
+    servers_contacted: list[str]
+    failed_servers: list[str]
+    result: LocalInsightsResult
 
 
 # ── Cluster fixo (6 nós, abril a setembro/2014) ───────────────────────────────
@@ -221,6 +260,8 @@ DB_PATH: Path = DATA_DIR / f"{SERVER_ID}.db"
 
 PICKUP_CSV_FMT: str = "%m/%d/%Y %H:%M:%S"
 PICKUP_SQL_FMT: str = "%Y-%m-%d %H:%M:%S"  # formato de exibição do PDF (e chave de ordenação em texto)
+GEO_GRID_PRECISION: int = 2  # ~1,1 km de lado na latitude de NYC
+TOP_ZONES_LIMIT: int = 12
 
 app = FastAPI(title=f"Uber Distributed — {SERVER_ID}", version="3.1.0")
 
@@ -234,18 +275,38 @@ _db_lock = threading.Lock()
 RECORD_COUNT: int = 0
 
 
+_REQUIRED_PICKUP_COLUMNS: frozenset[str] = frozenset({"pickup_dt", "pickup_date", "base", "lat", "lon"})
+
+
 def _table_ready() -> bool:
-    """Retorna True se a tabela ``pickups`` já existe e tem pelo menos 1 linha."""
+    """Retorna True se ``pickups`` existe, tem o schema atual (com ``lat``/``lon``) e ao menos 1 linha.
+
+    Um ``.db`` gerado antes da coluna ``lat``/``lon`` existir é detectado
+    como schema antigo (colunas faltando) e força reimportação automática
+    em :func:`load_data`, sem precisar apagar o arquivo manualmente.
+    """
     try:
-        row = _conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pickups'"
-        ).fetchone()
-        if not row or row[0] == 0:
+        cols = {row[1] for row in _conn.execute("PRAGMA table_info(pickups)")}
+        if not _REQUIRED_PICKUP_COLUMNS <= cols:
             return False
         count = _conn.execute("SELECT COUNT(*) FROM pickups").fetchone()[0]
         return count > 0
     except sqlite3.Error:
         return False
+
+
+def _parse_float(value: Optional[str]) -> Optional[float]:
+    """Converte uma string em ``float``, retornando ``None`` se vazia/inválida.
+
+    Usado para ``Lat``/``Lon`` do CSV: preferimos manter a linha (com
+    coordenada nula) a descartá-la só por falta/erro de geolocalização.
+    """
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _import_csv() -> None:
@@ -273,7 +334,9 @@ def _import_csv() -> None:
                 continue
             base = (row.get("Base") or "").strip()
             dt_str = dt.strftime(PICKUP_SQL_FMT)
-            yield dt_str, dt_str[:10], base
+            lat = _parse_float(row.get("Lat"))
+            lon = _parse_float(row.get("Lon"))
+            yield dt_str, dt_str[:10], base, lat, lon
 
     _conn.execute("DROP TABLE IF EXISTS pickups")
     _conn.execute(
@@ -281,13 +344,16 @@ def _import_csv() -> None:
         CREATE TABLE pickups (
             pickup_dt   TEXT NOT NULL,
             pickup_date TEXT NOT NULL,
-            base        TEXT NOT NULL
+            base        TEXT NOT NULL,
+            lat         REAL,
+            lon         REAL
         )
         """
     )
-    _conn.executemany("INSERT INTO pickups VALUES (?, ?, ?)", parsed_rows())
+    _conn.executemany("INSERT INTO pickups VALUES (?, ?, ?, ?, ?)", parsed_rows())
     _conn.execute("CREATE INDEX idx_pickup_date ON pickups(pickup_date)")
     _conn.execute("CREATE INDEX idx_pickup_date_base ON pickups(pickup_date, base)")
+    _conn.execute("CREATE INDEX idx_pickup_date_geo ON pickups(pickup_date, lat, lon)")
     _conn.commit()
 
 
@@ -407,6 +473,108 @@ def merge_results(parts: list[SummaryResult]) -> SummaryResult:
         "base_counts": base_counts,
         "first_pickup": first_dt,
         "last_pickup": last_dt,
+    }
+
+
+def insights(start: date, end: date, base: Optional[str] = None) -> LocalInsightsResult:
+    """Cruza hora do dia, dia da semana e zona geográfica no intervalo local.
+
+    Usa SQL indexado (sem carregar linhas em Python). Zonas são células de
+    grade ``ROUND(lat/lon, GEO_GRID_PRECISION)`` (~1,1 km), limitadas ao
+    top :data:`TOP_ZONES_LIMIT`.
+
+    Args:
+        start: Data inicial (inclusiva).
+        end: Data final (inclusiva).
+        base: Se informado, filtra pela coluna Base do CSV.
+
+    Returns:
+        Contagens por hora (``00``–``23``), por dia da semana (``0``=domingo
+        a ``6``=sábado, padrão SQLite) e as zonas de maior demanda.
+    """
+    where = "pickup_date >= ? AND pickup_date <= ?"
+    args: list[Any] = [start.isoformat(), end.isoformat()]
+    if base:
+        where += " AND base = ?"
+        args.append(base)
+
+    with _db_lock:
+        by_hour = {
+            str(h): int(c)
+            for h, c in _conn.execute(
+                f"SELECT strftime('%H', pickup_dt) h, COUNT(*) FROM pickups "
+                f"WHERE {where} GROUP BY h",
+                args,
+            ).fetchall()
+        }
+        by_weekday = {
+            str(wd): int(c)
+            for wd, c in _conn.execute(
+                f"SELECT strftime('%w', pickup_date) wd, COUNT(*) FROM pickups "
+                f"WHERE {where} GROUP BY wd",
+                args,
+            ).fetchall()
+        }
+        zones = _conn.execute(
+            f"""SELECT ROUND(lat, {GEO_GRID_PRECISION}) glat,
+                       ROUND(lon, {GEO_GRID_PRECISION}) glon,
+                       COUNT(*) c
+                FROM pickups
+                WHERE {where} AND lat IS NOT NULL AND lon IS NOT NULL
+                GROUP BY glat, glon
+                ORDER BY c DESC
+                LIMIT {TOP_ZONES_LIMIT}""",
+            args,
+        ).fetchall()
+
+    return {
+        "by_hour": by_hour,
+        "by_weekday": by_weekday,
+        "top_zones": [
+            {"lat": float(lat), "lon": float(lon), "count": int(c)}
+            for lat, lon, c in zones
+            if lat is not None and lon is not None
+        ],
+    }
+
+
+def merge_insights(parts: list[LocalInsightsResult]) -> LocalInsightsResult:
+    """Mescla vários :class:`LocalInsightsResult` em um único resumo agregado.
+
+    Soma ``by_hour`` e ``by_weekday`` por chave. Para ``top_zones``, soma
+    contagens por célula ``(lat, lon)`` repetida entre nós e reordena,
+    mantendo as :data:`TOP_ZONES_LIMIT` maiores no total.
+
+    Limitação: como cada nó já manda só o próprio top-N, uma zona pequena
+    em todos os nós individualmente mas grande na soma pode não aparecer —
+    aceitável para o propósito exploratório deste endpoint.
+
+    Args:
+        parts: Lista de insights parciais (local + vizinhos).
+
+    Returns:
+        Insights consolidados com os mesmos campos de :class:`LocalInsightsResult`.
+    """
+    by_hour: dict[str, int] = {}
+    by_weekday: dict[str, int] = {}
+    zone_totals: dict[tuple[float, float], int] = {}
+
+    for res in parts:
+        for h, c in res.get("by_hour", {}).items():
+            by_hour[h] = by_hour.get(h, 0) + int(c)
+        for wd, c in res.get("by_weekday", {}).items():
+            by_weekday[wd] = by_weekday.get(wd, 0) + int(c)
+        for zone in res.get("top_zones", []):
+            key = (float(zone["lat"]), float(zone["lon"]))
+            zone_totals[key] = zone_totals.get(key, 0) + int(zone["count"])
+
+    top = sorted(zone_totals.items(), key=lambda item: item[1], reverse=True)[:TOP_ZONES_LIMIT]
+    return {
+        "by_hour": by_hour,
+        "by_weekday": by_weekday,
+        "top_zones": [
+            {"lat": lat, "lon": lon, "count": count} for (lat, lon), count in top
+        ],
     }
 
 
@@ -662,4 +830,102 @@ async def distributed_summary(
         "servers_contacted": contacted,
         "failed_servers": failed,
         "result": merge_results(parts),
+    }
+
+
+@app.get("/local/insights")
+def local_insights(
+    start_date: str = Query(..., description="YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYY-MM-DD"),
+    base: Optional[str] = Query(None),
+) -> LocalInsightsResponse:
+    """Cruzamentos locais: demanda por hora, dia da semana e zona geográfica.
+
+    Endpoint opcional (métricas extras do PDF §7). Não altera
+    ``/local/summary`` nem o schema obrigatório.
+
+    Args:
+        start_date: Data inicial no formato ``YYYY-MM-DD``.
+        end_date: Data final no formato ``YYYY-MM-DD``.
+        base: Filtro opcional pela base TLC.
+
+    Raises:
+        HTTPException: Datas inválidas ou ``start_date`` > ``end_date``.
+    """
+    start, end = parse_date(start_date, "start_date"), parse_date(end_date, "end_date")
+    if start > end:
+        raise HTTPException(400, "start_date não pode ser maior que end_date.")
+
+    base_clean = base.strip() if base else None
+    return {
+        "server_id": SERVER_ID,
+        "scope": "local",
+        "complete": True,
+        "result": insights(start, end, base_clean),
+    }
+
+
+@app.get("/insights")
+async def distributed_insights(
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    base: Optional[str] = Query(None),
+) -> InsightsResponse:
+    """Coordena insights distribuídos agregando ``/local/insights`` dos vizinhos.
+
+    Mesmo padrão de :func:`distributed_summary`: filtra vizinhos relevantes,
+    chama só ``/local/insights`` (sem ciclo) e mescla com :func:`merge_insights`.
+
+    Args:
+        start_date: Data inicial no formato ``YYYY-MM-DD``.
+        end_date: Data final no formato ``YYYY-MM-DD``.
+        base: Filtro opcional pela base TLC.
+
+    Raises:
+        HTTPException: Datas inválidas ou ``start_date`` > ``end_date``.
+    """
+    start, end = parse_date(start_date, "start_date"), parse_date(end_date, "end_date")
+    if start > end:
+        raise HTTPException(400, "start_date não pode ser maior que end_date.")
+
+    base_clean = base.strip() if base else None
+    params: dict[str, Any] = {"start_date": start_date, "end_date": end_date}
+    if base_clean:
+        params["base"] = base_clean
+
+    local = insights(start, end, base_clean)
+    contacted: list[str] = [SERVER_ID]
+    failed: list[str] = []
+    parts: list[LocalInsightsResult] = [local]
+
+    async def fetch(
+        url: str,
+    ) -> tuple[Optional[LocalInsightsResult], str, Optional[str]]:
+        """Busca ``/local/insights`` em ``url``."""
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                r = await client.get(f"{url.rstrip('/')}/local/insights", params=params)
+                r.raise_for_status()
+                data = r.json()
+                return data.get("result"), data.get("server_id") or url, None
+        except Exception as exc:
+            return None, url, str(exc)
+
+    relevant_urls, _skipped = _split_relevant_servers(start, end)
+    for result, server_ref, err in await asyncio.gather(*[fetch(u) for u in relevant_urls]):
+        if err or result is None:
+            node_cfg = NODES.get(_port_from_url(server_ref) or -1)
+            failed.append(node_cfg["server_id"] if node_cfg else server_ref)
+        else:
+            contacted.append(server_ref)
+            parts.append(result)
+
+    return {
+        "scope": "distributed",
+        "coordinator": SERVER_ID,
+        "query": {"start_date": start_date, "end_date": end_date, "base": base_clean},
+        "complete": len(failed) == 0,
+        "servers_contacted": contacted,
+        "failed_servers": failed,
+        "result": merge_insights(parts),
     }
