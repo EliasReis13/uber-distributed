@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Sobe / para o cluster Uber (3 servidores).
+"""Sobe / para o cluster Uber (6 servidores).
 
 Uso
 ---
 ::
 
-    python start.py       # sobe 8001–8003
+    python start.py       # abre 6 janelas de terminal, uma por servidor (8001–8006)
     python start.py stop  # encerra
-    python start.py 1     # sobe só o servidor 01
+    python start.py 1     # sobe só o servidor 01, no terminal atual
+
+Para implantação em rede real (uma máquina por servidor), use
+``python start.py N`` em cada máquina (ver README.md, seção "Rodando em
+máquinas diferentes na mesma rede").
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -20,7 +25,68 @@ import time
 from pathlib import Path
 
 ROOT: Path = Path(__file__).resolve().parent
-PORTS: list[int] = [8001, 8002, 8003]
+PORTS: list[int] = [8001, 8002, 8003, 8004, 8005, 8006]
+
+
+def _uvicorn_command(port: int) -> str:
+    """Monta a linha de comando (string) que sobe o uvicorn na ``port``."""
+    return f'"{sys.executable}" -m uvicorn server.app:app --host 0.0.0.0 --port {port} --log-level info'
+
+
+def open_terminal_for(port: int) -> bool:
+    """Abre uma nova janela/aba de terminal rodando o nó ``port``.
+
+    Tenta, em ordem: Windows (``cmd /c start``), macOS (``osascript`` +
+    Terminal.app) e Linux (``gnome-terminal``/``x-terminal-emulator``/``xterm``).
+
+    Returns:
+        ``True`` se conseguiu abrir uma janela nova; ``False`` se nenhum
+        mecanismo de terminal foi encontrado (o chamador deve then usar o
+        fallback em background).
+    """
+    title = f"servidor_{port - 8000:02d}"
+    server_cmd = _uvicorn_command(port)
+
+    if sys.platform == "win32":
+        set_env = f"set SERVER_PORT={port}&&"
+        inner = f'{set_env}{server_cmd}'
+        subprocess.Popen(
+            f'cmd /c start "{title}" cmd /k "{inner}"',
+            cwd=ROOT,
+            shell=True,
+        )
+        return True
+
+    if sys.platform == "darwin":
+        env_prefix = f"export SERVER_PORT={port};"
+        script = f'cd {ROOT}; {env_prefix} {server_cmd}'
+        osa = (
+            'tell application "Terminal" to do script '
+            f'"{script}"'
+        )
+        try:
+            subprocess.Popen(["osascript", "-e", osa])
+            return True
+        except OSError:
+            return False
+
+    # Linux / demais Unix: tenta emuladores de terminal comuns.
+    env = os.environ.copy()
+    env["SERVER_PORT"] = str(port)
+    for emulator, args in (
+        ("gnome-terminal", ["--title", title, "--", "bash", "-c", f"{server_cmd}; exec bash"]),
+        ("x-terminal-emulator", ["-T", title, "-e", "bash", "-c", f"{server_cmd}; exec bash"]),
+        ("xterm", ["-T", title, "-e", "bash", "-c", f"{server_cmd}; exec bash"]),
+    ):
+        path = shutil.which(emulator)
+        if path is None:
+            continue
+        try:
+            subprocess.Popen([path, *args], cwd=ROOT, env=env)
+            return True
+        except OSError:
+            continue
+    return False
 
 
 def pid_on_port(port: int) -> int | None:
@@ -58,7 +124,7 @@ def pid_on_port(port: int) -> int | None:
 
 
 def stop_all() -> None:
-    """Encerra processos nas portas do cluster (8001–8003).
+    """Encerra processos nas portas do cluster (8001–8006).
 
     Windows: ``taskkill /F``. Unix: ``SIGTERM``.
     """
@@ -77,7 +143,7 @@ def stop_all() -> None:
         except OSError as exc:
             print(f"  porta {port}: falha ao encerrar PID {pid}: {exc}")
     if not killed:
-        print("Nenhum servidor ativo nas portas 8001–8003.")
+        print("Nenhum servidor ativo nas portas 8001-8006.")
     else:
         print(f"Encerrados {len(killed)} processo(s).")
 
@@ -89,7 +155,7 @@ def start_one(port: int, *, foreground: bool = False) -> subprocess.Popen[bytes]
     em uso, apenas registra e retorna ``None``.
 
     Args:
-        port: Porta do nó (8001, 8002 ou 8003).
+        port: Porta do nó (8001 a 8006).
         foreground: Se ``True``, bloqueia no processo (útil para um nó só);
             se ``False``, sobe em background via :class:`subprocess.Popen`.
 
@@ -98,7 +164,7 @@ def start_one(port: int, *, foreground: bool = False) -> subprocess.Popen[bytes]
     """
     existing = pid_on_port(port)
     if existing is not None:
-        print(f"  porta {port} já em uso (PID {existing}) — pulando")
+        print(f"  porta {port} ja em uso (PID {existing}) - pulando")
         return None
 
     env = os.environ.copy()
@@ -118,19 +184,46 @@ def start_one(port: int, *, foreground: bool = False) -> subprocess.Popen[bytes]
 
 
 def start_all() -> None:
-    """Sobe os três nós e aguarda até Ctrl+C ou término dos processos.
+    """Sobe os seis nós, cada um em sua própria janela de terminal.
 
     Se alguma porta do cluster já estiver ocupada, chama :func:`stop_all`
-    antes de reiniciar.
+    antes de reiniciar. Se não for possível abrir janelas novas (SO sem
+    terminal reconhecido), cai no modo antigo: sobe tudo em background no
+    terminal atual e aguarda Ctrl+C para encerrar.
     """
     if any(pid_on_port(p) for p in PORTS):
-        print("Liberando portas ocupadas…")
+        print("Liberando portas ocupadas...")
         stop_all()
         time.sleep(1)
 
-    print("Iniciando cluster (3 servidores)…\n")
+    print("Iniciando cluster (6 servidores, uma janela cada)...\n")
+    opened = 0
+    for port in PORTS:
+        if pid_on_port(port) is not None:
+            print(f"  porta {port} ja em uso - pulando")
+            continue
+        title = f"servidor_{port - 8000:02d}"
+        if open_terminal_for(port):
+            print(f"  > {title} -> nova janela -> http://localhost:{port}/")
+            opened += 1
+        else:
+            print("  Nenhum terminal grafico encontrado; usando modo em segundo plano.")
+            _start_all_background()
+            return
+
+    if opened:
+        print("\nPronto. Interface: http://localhost:8001/")
+        print("Para encerrar: python start.py stop\n")
+
+
+def _start_all_background() -> None:
+    """Modo antigo: sobe os nós que faltam em background no mesmo terminal.
+
+    Usado como fallback quando nenhum emulador de terminal é encontrado.
+    Bloqueia até Ctrl+C, encerrando os processos filhos ao sair.
+    """
     procs: list[subprocess.Popen[bytes]] = [
-        p for p in (start_one(port) for port in PORTS) if p is not None
+        p for p in (start_one(port) for port in PORTS if pid_on_port(port) is None) if p is not None
     ]
 
     print("\nPronto. Interface: http://localhost:8001/")
@@ -143,7 +236,7 @@ def start_all() -> None:
             time.sleep(1)
         print("Todos os processos terminaram.")
     except KeyboardInterrupt:
-        print("\nEncerrando…")
+        print("\nEncerrando...")
         for p in procs:
             if p.poll() is None:
                 p.terminate()
@@ -155,7 +248,7 @@ def start_all() -> None:
 
 
 def main() -> None:
-    """CLI: sem args sobe o cluster; ``stop`` / ``1``|``2``|``3`` / ``help``."""
+    """CLI: sem args sobe o cluster; ``stop`` / ``1``..``6`` / ``help``."""
     os.chdir(ROOT)
     args = sys.argv[1:]
 
@@ -170,11 +263,11 @@ def main() -> None:
     if cmd in {"help", "-h", "--help"}:
         print(__doc__)
         return
-    if cmd in {"1", "2", "3"}:
+    if cmd in {"1", "2", "3", "4", "5", "6"}:
         start_one(8000 + int(cmd), foreground=True)
         return
 
-    sys.exit(f"Uso: python start.py [stop|1|2|3]\n{__doc__}")
+    sys.exit(f"Uso: python start.py [stop|1|2|3|4|5|6]\n{__doc__}")
 
 
 if __name__ == "__main__":
