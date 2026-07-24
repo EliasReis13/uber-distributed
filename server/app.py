@@ -1,7 +1,11 @@
 """Servidor FastAPI de um nó do cluster Uber NYC 2014.
 
-Cada processo atende uma porta (``SERVER_PORT``: 8001, 8002 ou 8003) e
-carrega apenas a partição mensal correspondente (abril, maio ou junho).
+Cada processo atende uma porta (``SERVER_PORT``: 8001 a 8006) e carrega
+apenas a partição mensal correspondente (abril a setembro/2014) em um banco
+SQLite em disco (``data/<server_id>.db``), indexado por data.
+
+Na primeira subida o CSV é importado; nas seguintes o ``.db`` já existente
+é reaproveitado (startup bem mais rápido).
 
 Endpoints principais:
 
@@ -17,13 +21,15 @@ import csv
 import io
 import logging
 import os
+import sqlite3
+import threading
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional, TypedDict
 from urllib.request import urlopen
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -38,13 +44,8 @@ class NodeConfig(TypedDict):
     server_id: str
     data_file: str
     partition: str
-
-
-class PickupRecord(TypedDict):
-    """Registro de embarque carregado em memória."""
-
-    datetime: datetime
-    base: str
+    date_start: str
+    date_end: str
 
 
 class SummaryResult(TypedDict):
@@ -65,11 +66,19 @@ class HealthResponse(TypedDict):
     records: int
 
 
+class MetadataOwns(TypedDict):
+    """Campo ``owns`` da resposta de ``GET /metadata``."""
+
+    date_start: str
+    date_end: str
+    partition_description: str
+
+
 class MetadataResponse(TypedDict):
     """Resposta de ``GET /metadata``."""
 
     server_id: str
-    owns: dict[str, str]
+    owns: MetadataOwns
     known_servers: list[str]
 
 
@@ -99,69 +108,136 @@ class LocalSummaryResponse(TypedDict):
     result: SummaryResult
 
 
+class SummaryQuery(TypedDict):
+    """Campo ``query`` ecoado na resposta de ``GET /summary``."""
+
+    start_date: str
+    end_date: str
+    base: Optional[str]
+
+
 class DistributedSummaryResponse(TypedDict):
     """Resposta de ``GET /summary`` (consulta coordenada)."""
 
     scope: str
     coordinator: str
+    query: SummaryQuery
     complete: bool
     servers_contacted: list[str]
     failed_servers: list[str]
     result: SummaryResult
 
 
-# ── Cluster fixo (3 nós) ──────────────────────────────────────────────────────
+# ── Cluster fixo (6 nós, abril a setembro/2014) ───────────────────────────────
 CSV_BASE = (
     "https://raw.githubusercontent.com/fivethirtyeight/uber-tlc-foil-response/"
     "master/uber-trip-data"
- 
 )
 NODES: dict[int, NodeConfig] = {
     8001: {
         "server_id": "servidor_01",
         "data_file": f"{CSV_BASE}/uber-raw-data-apr14.csv",
         "partition": "Abril/2014",
+        "date_start": "2014-04-01",
+        "date_end": "2014-04-30",
     },
     8002: {
         "server_id": "servidor_02",
         "data_file": f"{CSV_BASE}/uber-raw-data-may14.csv",
         "partition": "Maio/2014",
+        "date_start": "2014-05-01",
+        "date_end": "2014-05-31",
     },
     8003: {
         "server_id": "servidor_03",
         "data_file": f"{CSV_BASE}/uber-raw-data-jun14.csv",
         "partition": "Junho/2014",
+        "date_start": "2014-06-01",
+        "date_end": "2014-06-30",
+    },
+    8004: {
+        "server_id": "servidor_04",
+        "data_file": f"{CSV_BASE}/uber-raw-data-jul14.csv",
+        "partition": "Julho/2014",
+        "date_start": "2014-07-01",
+        "date_end": "2014-07-31",
+    },
+    8005: {
+        "server_id": "servidor_05",
+        "data_file": f"{CSV_BASE}/uber-raw-data-aug14.csv",
+        "partition": "Agosto/2014",
+        "date_start": "2014-08-01",
+        "date_end": "2014-08-31",
+    },
+    8006: {
+        "server_id": "servidor_06",
+        "data_file": f"{CSV_BASE}/uber-raw-data-sep14.csv",
+        "partition": "Setembro/2014",
+        "date_start": "2014-09-01",
+        "date_end": "2014-09-30",
     },
 }
 
 SERVER_PORT: int = int(os.getenv("SERVER_PORT", "8001"))
 if SERVER_PORT not in NODES:
-    raise SystemExit(f"SERVER_PORT inválida: {SERVER_PORT}. Use 8001, 8002 ou 8003.")
+    _valid_ports = ", ".join(str(p) for p in sorted(NODES))
+    raise SystemExit(f"SERVER_PORT inválida: {SERVER_PORT}. Use uma destas: {_valid_ports}.")
 
 NODE: NodeConfig = NODES[SERVER_PORT]
 SERVER_ID: str = NODE["server_id"]
-KNOWN_SERVERS: list[str] = [f"http://localhost:{p}" for p in NODES if p != SERVER_PORT]
-HTTP_TIMEOUT: float = 10.0
-STATIC_DIR: Path = Path(__file__).resolve().parent.parent / "static"
+
+# KNOWN_SERVERS pode ser configurado via variável de ambiente para apontar
+# para máquinas reais na rede, ex.:
+#   KNOWN_SERVERS=http://192.168.1.12:8002,http://192.168.1.13:8003
+# Se não informado, assume os outros nós na mesma máquina (localhost) —
+# útil para testar o cluster inteiro num só computador.
+_known_servers_env: str = os.getenv("KNOWN_SERVERS", "").strip()
+if _known_servers_env:
+    KNOWN_SERVERS: list[str] = [
+        u.strip().rstrip("/") for u in _known_servers_env.split(",") if u.strip()
+    ]
+else:
+    KNOWN_SERVERS = [f"http://localhost:{p}" for p in NODES if p != SERVER_PORT]
+
+HTTP_TIMEOUT: float = float(os.getenv("HTTP_TIMEOUT", "10"))
+ROOT_DIR: Path = Path(__file__).resolve().parent.parent
+STATIC_DIR: Path = ROOT_DIR / "static"
+DATA_DIR: Path = ROOT_DIR / "data"
+DB_PATH: Path = DATA_DIR / f"{SERVER_ID}.db"
 
 PICKUP_CSV_FMT: str = "%m/%d/%Y %H:%M:%S"
-PICKUP_DISPLAY_FMT: str = "%d/%m/%Y %H:%M:%S"
+PICKUP_SQL_FMT: str = "%Y-%m-%d %H:%M:%S"  # formato de exibição do PDF (e chave de ordenação em texto)
 
-app = FastAPI(title=f"Uber Distributed — {SERVER_ID}", version="2.0.0")
-records: list[PickupRecord] = []
+app = FastAPI(title=f"Uber Distributed — {SERVER_ID}", version="3.1.0")
+
+# ── Armazenamento: SQLite em disco, indexado por data ─────────────────────────
+# Uma única conexão compartilhada entre as threads do FastAPI (endpoints
+# síncronos rodam no threadpool do Starlette); `_db_lock` serializa o acesso,
+# suficiente para o volume de consultas deste projeto.
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+_conn: sqlite3.Connection = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+_db_lock = threading.Lock()
+RECORD_COUNT: int = 0
 
 
-def load_data() -> None:
-    """Carrega o CSV da partição deste nó em ``records``.
+def _table_ready() -> bool:
+    """Retorna True se a tabela ``pickups`` já existe e tem pelo menos 1 linha."""
+    try:
+        row = _conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pickups'"
+        ).fetchone()
+        if not row or row[0] == 0:
+            return False
+        count = _conn.execute("SELECT COUNT(*) FROM pickups").fetchone()[0]
+        return count > 0
+    except sqlite3.Error:
+        return False
 
-    Aceita URL HTTP (download) ou caminho local em ``NODE["data_file"]``.
-    Linhas com data inválida ou coluna ausente são ignoradas.
-    Em caso de falha de I/O, registra o erro e deixa ``records`` vazio.
-    """
-    global records
-    records = []
+
+def _import_csv() -> None:
+    """Baixa/lê o CSV da partição e popula a tabela ``pickups`` no ``.db``."""
     source = NODE["data_file"]
-    logger.info("Carregando %s …", source)
+    logger.info("Importando CSV em %s a partir de %s …", DB_PATH.name, source)
 
     try:
         if source.startswith("http"):
@@ -173,19 +249,59 @@ def load_data() -> None:
                 rows = list(csv.DictReader(f))
     except Exception as exc:
         logger.error("Falha ao carregar dados: %s", exc)
-        return
+        rows = []
 
-    for row in rows:
-        try:
-            dt = datetime.strptime(row["Date/Time"].strip(), PICKUP_CSV_FMT)
-        except (KeyError, ValueError):
-            continue
-        records.append({
-            "datetime": dt,
-            "base": (row.get("Base") or "").strip(),
-        })
+    def parsed_rows():
+        for row in rows:
+            try:
+                dt = datetime.strptime(row["Date/Time"].strip(), PICKUP_CSV_FMT)
+            except (KeyError, ValueError):
+                continue
+            base = (row.get("Base") or "").strip()
+            dt_str = dt.strftime(PICKUP_SQL_FMT)
+            yield dt_str, dt_str[:10], base
 
-    logger.info("%s: %d registros (%s)", SERVER_ID, len(records), NODE["partition"])
+    _conn.execute("DROP TABLE IF EXISTS pickups")
+    _conn.execute(
+        """
+        CREATE TABLE pickups (
+            pickup_dt   TEXT NOT NULL,
+            pickup_date TEXT NOT NULL,
+            base        TEXT NOT NULL
+        )
+        """
+    )
+    _conn.executemany("INSERT INTO pickups VALUES (?, ?, ?)", parsed_rows())
+    _conn.execute("CREATE INDEX idx_pickup_date ON pickups(pickup_date)")
+    _conn.execute("CREATE INDEX idx_pickup_date_base ON pickups(pickup_date, base)")
+    _conn.commit()
+
+
+def load_data() -> None:
+    """Abre o SQLite em disco; importa o CSV só se o banco ainda estiver vazio.
+
+    Aceita URL HTTP (download) ou caminho local em ``NODE["data_file"]``.
+    Linhas com data inválida ou coluna ausente são ignoradas. Em caso de
+    falha de I/O, registra o erro e deixa a tabela vazia.
+    """
+    global RECORD_COUNT
+
+    with _db_lock:
+        if _table_ready():
+            RECORD_COUNT = _conn.execute("SELECT COUNT(*) FROM pickups").fetchone()[0]
+            logger.info(
+                "%s: reaproveitando %s (%d registros, %s)",
+                SERVER_ID, DB_PATH.name, RECORD_COUNT, NODE["partition"],
+            )
+            return
+
+        _import_csv()
+        RECORD_COUNT = _conn.execute("SELECT COUNT(*) FROM pickups").fetchone()[0]
+
+    logger.info(
+        "%s: %d registros em %s (%s)",
+        SERVER_ID, RECORD_COUNT, DB_PATH.name, NODE["partition"],
+    )
 
 
 def parse_date(value: str, name: str) -> date:
@@ -207,12 +323,8 @@ def parse_date(value: str, name: str) -> date:
         raise HTTPException(400, f"Formato inválido para '{name}'. Use YYYY-MM-DD.")
 
 
-def summarize(
-    start: date,
-    end: date,
-    base: Optional[str] = None,
-) -> SummaryResult:
-    """Conta embarques locais no intervalo ``[start, end]``.
+def summarize(start: date, end: date, base: Optional[str] = None) -> SummaryResult:
+    """Conta embarques locais no intervalo ``[start, end]`` via SQL indexado.
 
     Args:
         start: Data inicial (inclusiva).
@@ -221,32 +333,29 @@ def summarize(
 
     Returns:
         Contagem total, contagens por base e timestamps do primeiro/último
-        embarque no formato de exibição ``PICKUP_DISPLAY_FMT``.
+        embarque no formato ``YYYY-MM-DD HH:MM:SS`` (igual ao especificado
+        no enunciado do trabalho).
     """
-    count = 0
-    base_counts: dict[str, int] = {}
-    first_dt: Optional[datetime] = None
-    last_dt: Optional[datetime] = None
+    where = "pickup_date >= ? AND pickup_date <= ?"
+    args: list[Any] = [start.isoformat(), end.isoformat()]
+    if base:
+        where += " AND base = ?"
+        args.append(base)
 
-    for r in records:
-        d = r["datetime"].date()
-        if d < start or d > end:
-            continue
-        if base and r["base"] != base:
-            continue
-        count += 1
-        base_counts[r["base"]] = base_counts.get(r["base"], 0) + 1
-        dt = r["datetime"]
-        if first_dt is None or dt < first_dt:
-            first_dt = dt
-        if last_dt is None or dt > last_dt:
-            last_dt = dt
+    with _db_lock:
+        rows = _conn.execute(
+            f"SELECT base, COUNT(*) FROM pickups WHERE {where} GROUP BY base", args
+        ).fetchall()
+        first_raw, last_raw = _conn.execute(
+            f"SELECT MIN(pickup_dt), MAX(pickup_dt) FROM pickups WHERE {where}", args
+        ).fetchone()
 
+    base_counts = {b: c for b, c in rows}
     return {
-        "pickup_count": count,
+        "pickup_count": sum(base_counts.values()),
         "base_counts": base_counts,
-        "first_pickup": first_dt.strftime(PICKUP_DISPLAY_FMT) if first_dt else None,
-        "last_pickup": last_dt.strftime(PICKUP_DISPLAY_FMT) if last_dt else None,
+        "first_pickup": first_raw,
+        "last_pickup": last_raw,
     }
 
 
@@ -254,7 +363,8 @@ def merge_results(parts: list[SummaryResult]) -> SummaryResult:
     """Mescla vários :class:`SummaryResult` em um único resumo agregado.
 
     Soma ``pickup_count`` e ``base_counts``; escolhe o menor ``first_pickup``
-    e o maior ``last_pickup`` entre as partes.
+    e o maior ``last_pickup`` entre as partes (comparação em texto funciona
+    porque as datas estão no formato ordenável ``YYYY-MM-DD HH:MM:SS``).
 
     Args:
         parts: Lista de resumos parciais (local + vizinhos).
@@ -264,37 +374,31 @@ def merge_results(parts: list[SummaryResult]) -> SummaryResult:
     """
     total = 0
     base_counts: dict[str, int] = {}
-    first_dt: Optional[datetime] = None
-    last_dt: Optional[datetime] = None
+    first_dt: Optional[str] = None
+    last_dt: Optional[str] = None
 
     for res in parts:
         total += res.get("pickup_count", 0)
         for b, c in res.get("base_counts", {}).items():
             base_counts[b] = base_counts.get(b, 0) + c
-        for field, better in (("first_pickup", min), ("last_pickup", max)):
-            val = res.get(field)
-            if not val:
-                continue
-            try:
-                dt = datetime.strptime(val, PICKUP_DISPLAY_FMT)
-            except ValueError:
-                continue
-            if field == "first_pickup":
-                first_dt = dt if first_dt is None else better(first_dt, dt)
-            else:
-                last_dt = dt if last_dt is None else better(last_dt, dt)
+        first_val = res.get("first_pickup")
+        if first_val and (first_dt is None or first_val < first_dt):
+            first_dt = first_val
+        last_val = res.get("last_pickup")
+        if last_val and (last_dt is None or last_val > last_dt):
+            last_dt = last_val
 
     return {
         "pickup_count": total,
         "base_counts": base_counts,
-        "first_pickup": first_dt.strftime(PICKUP_DISPLAY_FMT) if first_dt else None,
-        "last_pickup": last_dt.strftime(PICKUP_DISPLAY_FMT) if last_dt else None,
+        "first_pickup": first_dt,
+        "last_pickup": last_dt,
     }
 
 
 @app.on_event("startup")
 def startup() -> None:
-    """Hook de startup: carrega a partição CSV deste nó."""
+    """Hook de startup: abre/importa o SQLite da partição deste nó."""
     load_data()
 
 
@@ -313,21 +417,23 @@ def home() -> FileResponse:
 
 @app.get("/health")
 def health() -> HealthResponse:
-    """Retorna status do nó, partição e quantidade de registros em memória."""
+    """Retorna status do nó, partição e quantidade de registros carregados."""
     return {
         "status": "ok",
         "server_id": SERVER_ID,
         "partition": NODE["partition"],
-        "records": len(records),
+        "records": RECORD_COUNT,
     }
 
 
 @app.get("/metadata")
 def metadata() -> MetadataResponse:
-    """Retorna metadados do nó e URLs dos servidores conhecidos."""
+    """Retorna metadados do nó (intervalo de dados que possui) e vizinhos conhecidos."""
     return {
         "server_id": SERVER_ID,
         "owns": {
+            "date_start": NODE["date_start"],
+            "date_end": NODE["date_end"],
             "partition_description": NODE["partition"],
         },
         "known_servers": KNOWN_SERVERS,
@@ -335,15 +441,23 @@ def metadata() -> MetadataResponse:
 
 
 @app.get("/cluster/status")
-async def cluster_status() -> ClusterStatusResponse:
+async def cluster_status(request: Request) -> ClusterStatusResponse:
     """Sonda ``/health`` nos vizinhos e monta o panorama do cluster.
 
     O nó atual é sempre marcado como online; falhas de rede nos vizinhos
-    aparecem com ``online: false``.
+    aparecem com ``online: false``. A URL deste nó é derivada de
+    ``request.base_url``, refletindo o host/porta reais usados pelo
+    cliente para chegar até aqui — em vez de assumir ``localhost``, o que
+    seria incorreto quando o nó roda em outra máquina da rede.
+
+    Args:
+        request: Requisição HTTP recebida (usada só para extrair o host
+            pelo qual este nó foi acessado).
     """
+    self_url = str(request.base_url).rstrip("/")
     nodes: list[ClusterNodeStatus] = [
         {
-            "url": f"http://localhost:{SERVER_PORT}",
+            "url": self_url,
             "server_id": SERVER_ID,
             "online": True,
             "self": True,
@@ -399,11 +513,12 @@ def local_summary(
     if start > end:
         raise HTTPException(400, "start_date não pode ser maior que end_date.")
 
+    base_clean = base.strip() if base else None
     return {
         "server_id": SERVER_ID,
         "scope": "local",
         "complete": True,
-        "result": summarize(start, end, base),
+        "result": summarize(start, end, base_clean),
     }
 
 
@@ -431,11 +546,12 @@ async def distributed_summary(
     if start > end:
         raise HTTPException(400, "start_date não pode ser maior que end_date.")
 
+    base_clean = base.strip() if base else None
     params: dict[str, Any] = {"start_date": start_date, "end_date": end_date}
-    if base:
-        params["base"] = base
+    if base_clean:
+        params["base"] = base_clean
 
-    local = summarize(start, end, base)
+    local = summarize(start, end, base_clean)
     contacted: list[str] = [SERVER_ID]
     failed: list[str] = []
     parts: list[SummaryResult] = [local]
@@ -476,6 +592,7 @@ async def distributed_summary(
     return {
         "scope": "distributed",
         "coordinator": SERVER_ID,
+        "query": {"start_date": start_date, "end_date": end_date, "base": base_clean},
         "complete": len(failed) == 0,
         "servers_contacted": contacted,
         "failed_servers": failed,
