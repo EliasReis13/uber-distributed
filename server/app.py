@@ -4,6 +4,10 @@ Cada processo atende uma porta (``SERVER_PORT``: 8001 a 8006) e carrega
 apenas a partição mensal correspondente (abril a setembro/2014) em um banco
 SQLite em disco (``data/<server_id>.db``), indexado por data.
 
+``SERVER_PORT``, ``KNOWN_SERVERS`` e ``HTTP_TIMEOUT`` podem ser definidos
+por variáveis de ambiente ou por um arquivo ``.env`` na raiz do projeto
+(veja ``.env.example``) — útil quando cada máquina roda sempre o mesmo nó.
+
 Na primeira subida o CSV é importado; nas seguintes o ``.db`` já existente
 é reaproveitado (startup bem mais rápido).
 
@@ -29,8 +33,18 @@ from typing import Any, Optional, TypedDict
 from urllib.request import urlopen
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
+
+# Carrega variáveis de um arquivo ``.env`` na raiz do projeto (se existir),
+# permitindo configurar SERVER_PORT/KNOWN_SERVERS/HTTP_TIMEOUT sem exportar
+# nada manualmente no shell a cada terminal aberto. Não sobrescreve
+# variáveis já definidas no ambiente (override=False por padrão), então
+# `$env:KNOWN_SERVERS = "..."` continua tendo prioridade sobre o `.env`.
+# Garante que funcione também quando o módulo é executado diretamente via
+# `uvicorn server.app:app` fora da raiz do projeto.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -396,6 +410,59 @@ def merge_results(parts: list[SummaryResult]) -> SummaryResult:
     }
 
 
+def _port_from_url(url: str) -> Optional[int]:
+    """Extrai a porta TCP final de uma URL tipo ``http://host:porta``.
+
+    Args:
+        url: URL de um servidor conhecido (ex.: ``http://192.168.0.176:8002``).
+
+    Returns:
+        A porta como ``int``, ou ``None`` se não for possível parsear.
+    """
+    try:
+        return int(url.rstrip("/").rsplit(":", 1)[-1])
+    except ValueError:
+        return None
+
+
+def _split_relevant_servers(start: date, end: date) -> tuple[list[str], list[str]]:
+    """Separa ``KNOWN_SERVERS`` em relevantes e ignorados para ``[start, end]``.
+
+    Um vizinho é relevante quando o mês de sua partição (conforme a config
+    estática :data:`NODES`) se sobrepõe ao intervalo consultado. A decisão é
+    tomada localmente, sem nenhuma chamada de rede extra — o coordenador já
+    conhece o intervalo de cada partição do cluster (passo 4 do fluxo
+    distribuído: "verifica, via configuração..., quais outros servidores
+    podem ter dados relevantes").
+
+    Se a porta de uma URL não corresponder a nenhum nó em ``NODES`` (ex.:
+    deployment customizado com outro mapeamento porta→mês), o vizinho é
+    mantido como relevante por precaução — só filtramos o que temos certeza.
+
+    Args:
+        start: Data inicial da consulta (inclusiva).
+        end: Data final da consulta (inclusiva).
+
+    Returns:
+        Tupla ``(urls_relevantes, server_ids_ignorados)``.
+    """
+    relevant: list[str] = []
+    skipped: list[str] = []
+    for url in KNOWN_SERVERS:
+        port = _port_from_url(url)
+        node_cfg = NODES.get(port) if port is not None else None
+        if node_cfg is None:
+            relevant.append(url)
+            continue
+        node_start = date.fromisoformat(node_cfg["date_start"])
+        node_end = date.fromisoformat(node_cfg["date_end"])
+        if node_start <= end and node_end >= start:
+            relevant.append(url)
+        else:
+            skipped.append(node_cfg["server_id"])
+    return relevant, skipped
+
+
 @app.on_event("startup")
 def startup() -> None:
     """Hook de startup: abre/importa o SQLite da partição deste nó."""
@@ -530,9 +597,12 @@ async def distributed_summary(
 ) -> DistributedSummaryResponse:
     """Coordena consulta distribuída agregando ``/local/summary`` dos vizinhos.
 
-    Calcula o resumo local, solicita o mesmo intervalo aos nós em
-    ``KNOWN_SERVERS`` e mescla com :func:`merge_results`. Vizinhos
-    inacessíveis entram em ``failed_servers`` e ``complete`` fica ``False``.
+    Calcula o resumo local, filtra ``KNOWN_SERVERS`` para os vizinhos cujo
+    mês se sobrepõe a ``[start_date, end_date]`` (via :func:`_split_relevant_servers`,
+    sem chamada de rede extra) e solicita o mesmo intervalo só a esses,
+    mesclando tudo com :func:`merge_results`. Vizinhos fora do intervalo
+    nem são contatados; vizinhos relevantes porém inacessíveis entram em
+    ``failed_servers`` e ``complete`` fica ``False``.
 
     Args:
         start_date: Data inicial no formato ``YYYY-MM-DD``.
@@ -574,17 +644,12 @@ async def distributed_summary(
         except Exception as exc:
             return None, url, str(exc)
 
-    for result, server_ref, err in await asyncio.gather(*[fetch(u) for u in KNOWN_SERVERS]):
+    relevant_urls, _skipped = _split_relevant_servers(start, end)
+    for result, server_ref, err in await asyncio.gather(*[fetch(u) for u in relevant_urls]):
         if err or result is None:
-            # tenta nome amigável pela porta conhecida
-            port: Optional[int] = None
-            try:
-                port = int(server_ref.rstrip("/").rsplit(":", 1)[-1])
-            except ValueError:
-                pass
-            node_cfg = NODES.get(port) if port is not None else None
-            name = node_cfg["server_id"] if node_cfg else server_ref
-            failed.append(name)
+            # tenta nome pela porta conhecida
+            node_cfg = NODES.get(_port_from_url(server_ref) or -1)
+            failed.append(node_cfg["server_id"] if node_cfg else server_ref)
         else:
             contacted.append(server_ref)
             parts.append(result)
